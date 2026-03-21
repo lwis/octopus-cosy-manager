@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Octopus Cosy Manager</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+  <header>
+    <div>
+      <a href="#" onclick="app.showDashboard(); return false;">
+        <h1>🔥 Octopus Cosy Manager</h1>
+      </a>
+    </div>
+    <div style="margin-left:auto;">
+      <button id="logout-btn" class="btn btn-secondary btn-sm hidden" onclick="app.logout()">Logout</button>
+    </div>
+  </header>
+  <main id="app">
+    <div id="loading-view" class="loading hidden">Loading...</div>
+
+    <div id="setup-view" class="hidden">
+      <div class="card" style="max-width: 500px; margin: 0 auto;">
+        <div class="card-title">Setup</div>
+        <p style="margin-bottom: 1rem; color: #4a5568;">
+          Enter your Octopus Energy API credentials. Your API key is <strong>stored securely in your local browser
+            storage</strong>
+          and is never sent to any external server. This web application runs entirely in your browser.
+        </p>
+        <form id="setup-form">
+          <div style="margin-bottom: 1rem;">
+            <label style="display:block; margin-bottom: 0.5rem; font-weight: 600;">API Key</label>
+            <input type="text" id="api-key" required placeholder="sk_live_...">
+          </div>
+          <button type="submit" id="setup-btn" class="btn btn-primary" style="width: 100%;">Connect</button>
+        </form>
+        <div id="device-selection" class="hidden">
+          <label style="display:block; margin-bottom: 0.5rem; font-weight: 600;">Select your Heat Pump</label>
+          <select id="device-selector" style="width: 100%; margin-bottom: 1rem;"></select>
+          <button id="select-device-btn" class="btn btn-primary" style="width: 100%;">Continue</button>
+        </div>
+        <div id="setup-error" class="alert alert-error hidden" style="margin-top: 1rem;"></div>
+      </div>
+    </div>
+
+    <div id="dashboard-view" class="hidden">
+      <!-- Dashboard content will be injected here -->
+    </div>
+
+    <div id="edit-zone-view" class="hidden">
+      <!-- Edit Zone content will be injected here -->
+    </div>
+
+    <div id="flow-temp-view" class="hidden"></div>
+    <div id="zone-override-view" class="hidden"></div>
+    <div id="performance-view" class="hidden"></div>
+  </main>
+
+  <script type="module">
+    import * as App from './js/app.js';
+    window.app = App; // Expose for onclick handlers
+    App.init();
+  </script>
+</body>
+
+</html>

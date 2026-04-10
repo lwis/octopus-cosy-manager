@@ -1,6 +1,7 @@
 // Octopus Energy API Client
 
 const API_URL = "https://api.octopus.energy/v1/graphql/";
+const BACKEND_API_URL = "https://api.backend.octopus.energy/v1/graphql/";
 
 export class OctopusClient {
     constructor(apiKey, account, euid) {
@@ -60,7 +61,7 @@ export class OctopusClient {
     async getConfiguration() {
         const query = `
             query GetConfig($accountNumber: String!, $euid: ID!) {
-                octoHeatPumpControllerConfiguration(accountNumber: $accountNumber, euid: $euid) {
+                heatPumpControllerConfiguration(accountNumber: $accountNumber, euid: $euid) {
                     controller {
                         accessPointPassword
                         connected
@@ -91,7 +92,6 @@ export class OctopusClient {
                         weatherCompensation {
                             allowableMaximumTemperatureRange { maximum { unit value } minimum { unit value } }
                             allowableMinimumTemperatureRange { maximum { unit value } minimum { unit value } }
-                            allowableRange { maximum { unit value } minimum { unit value } }
                             currentRange { maximum { unit value } minimum { unit value } }
                             enabled
                         }
@@ -119,17 +119,17 @@ export class OctopusClient {
                         }
                     }
                 }
-                octoHeatPumpLifetimePerformance(euid: $euid) {
+                heatPumpLifetimePerformance(accountNumber: $accountNumber, euid: $euid) {
                     seasonalCoefficientOfPerformance
                     heatOutput { unit value }
                     energyInput { unit value }
                     readAt
                 }
-                octoHeatPumpControllerStatus(accountNumber: $accountNumber, euid: $euid) {
+                heatPumpControllerStatus(accountNumber: $accountNumber, euid: $euid) {
                     sensors {
                         code
                         connectivity { online retrievedAt }
-                        telemetry { temperatureInCelsius humidityPercentage voltage retrievedAt }
+                        telemetry { temperatureInCelsius humidityPercentage rssi voltage retrievedAt }
                     }
                     zones {
                         zone
@@ -141,15 +141,15 @@ export class OctopusClient {
         const data = await this.gql(query, {
             accountNumber: this.account,
             euid: this.euid
-        }, true);
+        }, true, true);
 
-        if (!data.octoHeatPumpControllerConfiguration) {
+        if (!data.heatPumpControllerConfiguration) {
             throw new Error("No configuration returned (check account number and EUID)");
         }
 
-        const config = data.octoHeatPumpControllerConfiguration;
-        config.performance = data.octoHeatPumpLifetimePerformance;
-        const status = data.octoHeatPumpControllerStatus;
+        const config = data.heatPumpControllerConfiguration;
+        config.performance = data.heatPumpLifetimePerformance;
+        const status = data.heatPumpControllerStatus;
         
         // Merge schedules and telemetry into configuration for easier consumption
         config.zones.forEach(z => {
@@ -176,7 +176,7 @@ export class OctopusClient {
     async setZoneSchedules(zoneCode, schedules) {
         const query = `
             mutation SetZoneSchedules($accountNumber: String!, $euid: ID!, $params: SetZoneSchedulesParameters!) {
-                octoHeatPumpSetZoneSchedules(
+                heatPumpSetZoneSchedules(
                     accountNumber: $accountNumber
                     euid: $euid
                     zoneScheduleParameters: $params
@@ -214,7 +214,7 @@ export class OctopusClient {
             }
         };
 
-        await this.gql(query, vars, true);
+        await this.gql(query, vars, true, true);
     }
 
     // Helper: Convert API schedule (read) to App schedule (write)
@@ -233,16 +233,18 @@ export class OctopusClient {
         };
     }
 
-    async gql(query, variables, authed) {
+    async gql(query, variables, authed, useBackend = false) {
         const headers = {
             'Content-Type': 'application/json'
         };
         if (authed) {
             if (!this.token) throw new Error("Not authenticated");
-            headers['Authorization'] = 'JWT ' + this.token;
+            headers['Authorization'] = useBackend ? this.token : 'JWT ' + this.token;
         }
 
-        const response = await fetch(API_URL, {
+        const url = useBackend ? BACKEND_API_URL : API_URL;
+
+        const response = await fetch(url, {
             method: 'POST',
             headers: headers,
             body: JSON.stringify({ query, variables })
@@ -267,28 +269,30 @@ export class OctopusClient {
     // --- Device Mutations ---
     
     async rebootController() {
+        // Reboot not migrated to backend yet, keep hitting old endpoint
         const query = `mutation($a: String!, $e: ID!) { octoHeatPumpRebootController(accountNumber: $a, euid: $e) { transactionId } }`;
-        return this.gql(query, { a: this.account, e: this.euid }, true);
+        return this.gql(query, { a: this.account, e: this.euid }, true, false);
     }
 
     async setQuieterMode(enabled) {
-        const query = `mutation($e: ID!, $q: Boolean!) { octoHeatPumpSetQuieterMode(euid: $e, quieterModeEnabled: $q) { transactionId } }`;
-        return this.gql(query, { e: this.euid, q: enabled }, true);
+        const query = `mutation($a: String!, $e: ID!, $q: Boolean!) { heatPumpSetHushMode(accountNumber: $a, euid: $e, hushModeEnabled: $q) { transactionId } }`;
+        return this.gql(query, { a: this.account, e: this.euid, q: enabled }, true, true);
     }
 
     async updateWaterSetpoint(setpoint) {
+        // Hot water setpoint not in new schema, hitting old endpoint
         const query = `mutation($a: String!, $e: ID!, $s: Int!) { octoHeatPumpUpdateWaterSetpoint(accountNumber: $a, euid: $e, setpoint: $s) { transactionId } }`;
-        return this.gql(query, { a: this.account, e: this.euid, s: parseInt(setpoint, 10) }, true);
+        return this.gql(query, { a: this.account, e: this.euid, s: parseInt(setpoint, 10) }, true, false);
     }
 
     async updateSensorDisplayName(sensorCode, displayName) {
-        const query = `mutation($a: String!, $e: ID!, $sc: String!, $dn: String!) { octoHeatPumpUpdateSensorDisplayName(accountNumber: $a, euid: $e, sensorCode: $sc, displayName: $dn) { transactionId } }`;
-        return this.gql(query, { a: this.account, e: this.euid, sc: sensorCode, dn: displayName }, true);
+        const query = `mutation($a: String!, $e: ID!, $u: [UpdateSensorDisplayNameInput!]!) { heatPumpBulkUpdateSensorDisplayName(accountNumber: $a, euid: $e, updates: $u) { transactionId } }`;
+        return this.gql(query, { a: this.account, e: this.euid, u: [{ sensorCode, displayName }] }, true, true);
     }
 
     async setZonePrimarySensor(zone, sensorCode) {
-        const query = `mutation { octoHeatPumpSetZonePrimarySensor(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: {zone: ${zone}, sensorCode: "${sensorCode}"}) { transactionId } }`;
-        return this.gql(query, {}, true);
+        const query = `mutation { heatPumpSetZonePrimarySensor(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: {zone: ${zone}, sensorCode: "${sensorCode}"}) { transactionId } }`;
+        return this.gql(query, {}, true, true);
     }
 
     async setZoneMode(zone, mode, endAt, setpoint, action) {
@@ -299,8 +303,8 @@ export class OctopusClient {
         if (setpoint) opArgs += `, setpointInCelsius: "${setpoint}"`;
         opArgs += `}`;
         
-        const query = `mutation { octoHeatPumpSetZoneMode(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: ${opArgs}) { transactionId } }`;
-        return this.gql(query, {}, true);
+        const query = `mutation { heatPumpSetZoneMode(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: ${opArgs}) { transactionId } }`;
+        return this.gql(query, {}, true, true);
     }
 
     async updateFlowTemperatureConfiguration(useWc, flowTemp, minTemp, maxTemp) {
@@ -311,15 +315,15 @@ export class OctopusClient {
         let wcValues = `weatherCompensationValues: {minimum: {value: ${minTempStr}, unit: DEGREES_CELSIUS}, maximum: {value: ${maxTempStr}, unit: DEGREES_CELSIUS}}`;
         let flowValues = `flowTemperature: {value: ${flowTempStr}, unit: DEGREES_CELSIUS}`;
         
-        const query = `mutation { octoHeatPumpUpdateFlowTemperatureConfiguration(euid: "${this.euid}", flowTemperatureInput: {useWeatherCompensation: ${useWc}, ${flowValues}, ${wcValues}}) { transactionId } }`;
-        return this.gql(query, {}, true);
+        const query = `mutation { heatPumpUpdateFlowTemperatureConfiguration(accountNumber: "${this.account}", euid: "${this.euid}", flowTemperatureInput: {useWeatherCompensation: ${useWc}, ${flowValues}, ${wcValues}}) { transactionId } }`;
+        return this.gql(query, {}, true, true);
     }
 
     // --- Live Performance ---
 
     async getLivePerformance() {
-        const query = `query GetLivePerformance($euid: ID!) {
-            octoHeatPumpLivePerformance(euid: $euid) {
+        const query = `query GetLivePerformance($accountNumber: String!, $euid: ID!) {
+            heatPumpLivePerformance(accountNumber: $accountNumber, euid: $euid) {
                 readAt
                 coefficientOfPerformance
                 powerInput { value unit }
@@ -327,15 +331,15 @@ export class OctopusClient {
                 outdoorTemperature { value unit }
             }
         }`;
-        const data = await this.gql(query, { euid: this.euid }, true);
-        return data.octoHeatPumpLivePerformance;
+        const data = await this.gql(query, { accountNumber: this.account, euid: this.euid }, true, true);
+        return data.heatPumpLivePerformance;
     }
 
     // --- Performance History ---
     
     async getPerformanceHistory(startAt, endAt, grouping = 'WEEK') {
-        const queryStr = `query GetPerformance($euid: ID!, $start: DateTime!, $end: DateTime!, $grouping: PerformanceGrouping!) {
-            octoHeatPumpTimeSeriesPerformance(euid: $euid, performanceGrouping: $grouping, startAt: $start, endAt: $end) {
+        const queryStr = `query GetPerformance($accountNumber: String!, $euid: ID!, $start: DateTime!, $end: DateTime!, $grouping: PerformanceGrouping!) {
+            heatPumpTimeSeriesPerformance(accountNumber: $accountNumber, euid: $euid, performanceGrouping: $grouping, startAt: $start, endAt: $end) {
                 startAt
                 endAt
                 outdoorTemperature { unit value }
@@ -343,7 +347,7 @@ export class OctopusClient {
                 energyInput { unit value }
             }
         }`;
-        const data = await this.gql(queryStr, { euid: this.euid, start: startAt, end: endAt, grouping }, true);
-        return data.octoHeatPumpTimeSeriesPerformance || [];
+        const data = await this.gql(queryStr, { accountNumber: this.account, euid: this.euid, start: startAt, end: endAt, grouping }, true, true);
+        return data.heatPumpTimeSeriesPerformance || [];
     }
 }

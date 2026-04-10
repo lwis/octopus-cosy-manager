@@ -319,6 +319,7 @@ function renderDashboard(config, livePerf) {
                     let parts = [];
                     if (!isSentinel(s.telemetry.temperatureInCelsius)) parts.push(`${parseFloat(s.telemetry.temperatureInCelsius).toFixed(1)}°C`);
                     if (s.telemetry.humidityPercentage) parts.push(`${s.telemetry.humidityPercentage}% RH`);
+                    if (s.telemetry.rssi != null) parts.push(`📶 ${s.telemetry.rssi} dBm`);
                     if (s.telemetry.voltage) parts.push(`${s.telemetry.voltage}V`);
                     if (parts.length) telemetryLine = `<span style="color:#718096;">${parts.join(' · ')}</span>`;
                 }

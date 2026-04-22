@@ -4,10 +4,11 @@ const API_URL = "https://api.octopus.energy/v1/graphql/";
 const BACKEND_API_URL = "https://api.backend.octopus.energy/v1/graphql/";
 
 export class OctopusClient {
-    constructor(apiKey, account, euid) {
+    constructor(apiKey, account, euid, propertyId = null) {
         this.apiKey = apiKey;
         this.account = account;
         this.euid = euid;
+        this.propertyId = propertyId;
         this.token = null;
     }
 
@@ -173,7 +174,7 @@ export class OctopusClient {
         return config;
     }
 
-    async setZoneSchedules(zoneCode, schedules) {
+    async setZoneSchedules(zoneCode, zoneType, schedules) {
         const query = `
             mutation SetZoneSchedules($accountNumber: String!, $euid: ID!, $params: SetZoneSchedulesParameters!) {
                 heatPumpSetZoneSchedules(
@@ -193,9 +194,14 @@ export class OctopusClient {
                     let t = slot.time;
                     if (t.length === 5) t += ":00";
                     
+                    let action = slot.action;
+                    if (zoneType === "WATER" || zoneType === "HEAT") {
+                        if (action === "TURN_OFF") action = "OFF";
+                        else if (action === "TURN_ON") action = "ON";
+                    }
                     const mSlot = {
                         time: t,
-                        action: slot.action
+                        action
                     };
                     if (slot.setpointInCelsius != null) {
                         mSlot.setpointInCelsius = String(slot.setpointInCelsius);
@@ -290,6 +296,17 @@ export class OctopusClient {
         return this.gql(query, { a: this.account, e: this.euid, u: [{ sensorCode, displayName }] }, true, true);
     }
 
+    async setupSmartControl() {
+        if (!this.propertyId) throw new Error("Property ID not available to setup smart control.");
+        const query = `mutation($a: String!, $p: ID!, $e: ID!) { heatPumpSetupSmartControl(input: { accountNumber: $a, propertyId: $p, euid: $e }) { success } }`;
+        return this.gql(query, { a: this.account, p: this.propertyId, e: this.euid }, true, true);
+    }
+
+    async updateZoneDisplayName(zoneCode, newDisplayName) {
+        const query = `mutation($a: String!, $e: ID!, $u: [SetZoneDisplayNameParameters!]!) { heatPumpBulkUpdateZoneDisplayNames(accountNumber: $a, euid: $e, updates: $u) { transactionIds { transactionId } } }`;
+        return this.gql(query, { a: this.account, e: this.euid, u: [{ zoneCode, newDisplayName }] }, true, true);
+    }
+
     async setZonePrimarySensor(zone, sensorCode) {
         const query = `mutation { heatPumpSetZonePrimarySensor(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: {zone: ${zone}, sensorCode: "${sensorCode}"}) { transactionId } }`;
         return this.gql(query, {}, true, true);
@@ -350,4 +367,17 @@ export class OctopusClient {
         const data = await this.gql(queryStr, { accountNumber: this.account, euid: this.euid, start: startAt, end: endAt, grouping }, true, true);
         return data.heatPumpTimeSeriesPerformance || [];
     }
+
+    async getTimeRangedPerformance(startAt, endAt) {
+        const query = `query GetTotalPerformance($a: String!, $e: ID!, $start: DateTime!, $end: DateTime!) {
+            heatPumpTimeRangedPerformance(accountNumber: $a, euid: $e, startAt: $start, endAt: $end) {
+                coefficientOfPerformance
+                energyInput { unit value }
+                energyOutput { unit value }
+            }
+        }`;
+        const data = await this.gql(query, { a: this.account, e: this.euid, start: startAt, end: endAt }, true, true);
+        return data.heatPumpTimeRangedPerformance;
+    }
 }
+

@@ -108,7 +108,7 @@ async function handleSetup(e) {
         if (devices.length === 0) {
             throw new Error("No heat pumps found on your account.");
         } else if (devices.length === 1) {
-            finishSetup(apiKey, devices[0].account, devices[0].euid, tempClient);
+            finishSetup(apiKey, devices[0].account, devices[0].euid, devices[0].propertyId, tempClient);
         } else {
             const deviceSelector = document.getElementById('device-selector');
             deviceSelector.innerHTML = devices.map(d =>
@@ -119,7 +119,7 @@ async function handleSetup(e) {
 
             document.getElementById('select-device-btn').onclick = () => {
                 const selected = JSON.parse(deviceSelector.value);
-                finishSetup(apiKey, selected.account, selected.euid, tempClient);
+                finishSetup(apiKey, selected.account, selected.euid, selected.propertyId, tempClient);
             };
         }
     } catch (err) {
@@ -131,12 +131,13 @@ async function handleSetup(e) {
     }
 }
 
-async function finishSetup(apiKey, account, euid, tempClient) {
+async function finishSetup(apiKey, account, euid, propertyId, tempClient) {
     tempClient.account = account;
     tempClient.euid = euid;
+    tempClient.propertyId = propertyId;
     try {
         await tempClient.getConfiguration();
-        saveCredentials(apiKey, account, euid);
+        saveCredentials(apiKey, account, euid, propertyId);
         client = tempClient;
         showDashboard();
     } catch (err) {
@@ -251,6 +252,7 @@ function renderDashboard(config, livePerf) {
                 <div class="card-title">Controller & Hardware</div>
                 <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
                     <strong>State:</strong> ${c.state?.join(', ') || 'Unknown'} <a href="javascript:void(0)" onclick="app.rebootController()" style="margin-left:.25rem;color:#e53e3e;">[Reboot]</a><br/>
+                    <strong>Smart Control:</strong> <a href="javascript:void(0)" onclick="app.setupSmartControl()" style="margin-left:.25rem;color:#4299e1;">[Setup]</a><br/>
                     <strong>HW Version:</strong> ${hp.hardwareVersion || 'Unknown'}<br/>
                     <strong>FW (ESP32):</strong> ${c.firmwareConfiguration?.esp32 || 'Unknown'}<br/>
                     <strong>FW (EFR32):</strong> ${c.firmwareConfiguration?.efr32 || 'Unknown'}<br/>
@@ -311,7 +313,6 @@ function renderDashboard(config, livePerf) {
                 const opacity = dimmed ? 'opacity:.45;' : '';
 
                 let metaChips = [];
-                if (s.boostEnabled) metaChips.push(`<span class="chip" style="background:#ebf4ff;color:#2b6cb0;">Boost</span>`);
                 if (s.firmwareVersion && s.firmwareVersion !== '0D') metaChips.push(`<span class="chip" style="background:#f7fafc;color:#718096;">FW ${s.firmwareVersion}</span>`);
 
                 let telemetryLine = '';
@@ -385,6 +386,7 @@ function renderDashboard(config, livePerf) {
             <div class="card">
                 <div class="card-title" style="flex-wrap: wrap; gap: .5rem;">
                     ${zone.displayName}
+                    <button class="btn btn-secondary btn-sm" style="padding:.1rem .5rem;" onclick="app.renameZone('${zone.code}', '${zone.displayName || ''}')">Rename</button>
                     ${typeBadge}
                     ${heatDemandBadge}
                     ${callForHeatBadge}
@@ -392,7 +394,7 @@ function renderDashboard(config, livePerf) {
                     <button class="btn btn-sm btn-secondary" style="margin-left:auto;padding:.1rem .5rem;" onclick="app.showZoneOverride('${zone.code}')">Override</button>
                 </div>
                 <div class="zone-meta">
-                    Mode: <strong>${zone.currentOperation?.mode || 'None'}</strong>
+                    Mode: <strong>${zone.currentOperation?.mode || 'None'}</strong> <a href="javascript:void(0)" onclick="app.changeZoneMode('${zone.code}', '${zone.currentOperation?.mode || 'AUTO'}')" style="margin-left:.25rem;color:#4299e1;">[Change]</a>
                     ${zone.currentOperation?.setpointInCelsius ? `&nbsp;·&nbsp; Setpoint: <strong>${zone.currentOperation.setpointInCelsius.toFixed(1)}°C</strong>` : ''}
                     ${zone.currentOperation?.action ? `&nbsp;·&nbsp; Action: <strong>${zone.currentOperation.action}</strong>` : ''}
                     ${prevOpHtml}
@@ -463,7 +465,7 @@ function renderEditZoneForm(zone) {
             <p style="font-size:.85rem;color:#718096;margin-bottom:1.25rem;">
                 Edit the weekly schedule for this zone.
             </p>
-            <form id="scheduleForm" onsubmit="app.handleSaveSchedule(event, '${zone.code}')">
+            <form id="scheduleForm" onsubmit="app.handleSaveSchedule(event, '${zone.code}', '${zone.zoneType}')">
                 <div id="groups">
     `;
 
@@ -503,7 +505,7 @@ function fmtDays(mask) {
 // --- Exporting for UI interaction ---
 // The following functions need to be available globally or via the app object for the inline onclick handlers
 
-export function handleSaveSchedule(e, zoneCode) {
+export function handleSaveSchedule(e, zoneCode, zoneType) {
     e.preventDefault();
     const form = e.target;
     const msg = document.getElementById('edit-msg');
@@ -557,7 +559,7 @@ export function handleSaveSchedule(e, zoneCode) {
     msg.textContent = 'Saving...';
     msg.classList.remove('hidden');
 
-    client.setZoneSchedules(zoneCode, groups).then(() => {
+    client.setZoneSchedules(zoneCode, zoneType, groups).then(() => {
         msg.textContent = 'Schedule saved successfully!';
     }).catch(err => {
         msg.className = 'alert alert-error';
@@ -688,6 +690,28 @@ export async function editWaterSetpoint(min, max) {
         await showDashboard();
     } catch (e) {
         alert("Failed to update setpoint: " + e.message);
+    }
+}
+
+export async function renameZone(zoneCode, currentName) {
+    const val = prompt(`Enter new name for zone ${zoneCode}:`, currentName || "");
+    if (val === null || val === currentName) return;
+    try {
+        await client.updateZoneDisplayName(zoneCode, val);
+        await showDashboard();
+    } catch (e) {
+        alert("Failed to rename zone: " + e.message);
+    }
+}
+
+export async function setupSmartControl() {
+    if (!confirm("Are you sure you want to setup smart control for this heat pump?")) return;
+    try {
+        await client.setupSmartControl();
+        alert("Smart control setup initiated!");
+        await showDashboard();
+    } catch (e) {
+        alert("Failed to setup smart control: " + e.message);
     }
 }
 
@@ -843,6 +867,29 @@ export function toggleOverrideSetpoint(action) {
     document.getElementById('ov-setpoint').style.display = action === 'SET_TEMPERATURE' ? 'block' : 'none';
 }
 
+export async function changeZoneMode(zoneCode, currentMode) {
+    const mode = prompt(`Enter new mode for zone ${zoneCode} (AUTO, ON, OFF, BOOST):`, currentMode || "AUTO");
+    if (!mode) return;
+    
+    const validModes = ['AUTO', 'ON', 'OFF', 'BOOST'];
+    const cleanMode = mode.toUpperCase().trim();
+    
+    if (!validModes.includes(cleanMode)) {
+        alert("Invalid mode. Must be one of: AUTO, ON, OFF, BOOST");
+        return;
+    }
+    
+    if (cleanMode === currentMode) return;
+    
+    try {
+        await client.setZoneMode(zoneCode, cleanMode, null, null, null);
+        alert("Zone mode updated!");
+        await showDashboard();
+    } catch (e) {
+        alert("Failed to change zone mode: " + e.message);
+    }
+}
+
 export async function submitZoneOverride(form, zoneCode) {
     const mode = form.mode.value || null;
 
@@ -886,6 +933,26 @@ export async function showPerformanceHistory() {
         start.setDate(start.getDate() - 14);
 
         const allData = await client.getPerformanceHistory(start.toISOString(), end.toISOString());
+        const totalData = await client.getTimeRangedPerformance(start.toISOString(), end.toISOString());
+
+        let totalHtml = '';
+        if (totalData) {
+            const outEVal = parseFloat(totalData.energyOutput?.value);
+            const inVal = parseFloat(totalData.energyInput?.value);
+            const cop = totalData.coefficientOfPerformance ? parseFloat(totalData.coefficientOfPerformance).toFixed(2) : '-';
+            const elIn = !isNaN(inVal) ? inVal.toFixed(1) + ' kWh' : '-';
+            const htOut = !isNaN(outEVal) ? outEVal.toFixed(1) + ' kWh' : '-';
+            totalHtml = `
+                <div style="margin-bottom: 2rem; background: #f7fafc; padding: 1rem; border-radius: 8px; border: 1px solid #e2e8f0;">
+                    <h3 style="margin-bottom: .5rem; font-size: 1rem; color: #2d3748;">14-Day Totals</h3>
+                    <div style="display:flex; gap: 2rem; font-size: .95rem; color: #4a5568;">
+                        <div><strong>Energy In:</strong> ${elIn}</div>
+                        <div><strong>Heat Out:</strong> ${htOut}</div>
+                        <div><strong>Overall COP:</strong> ${cop}</div>
+                    </div>
+                </div>
+            `;
+        }
 
         let rows = '';
         if (allData && allData.length > 0) {
@@ -906,20 +973,21 @@ export async function showPerformanceHistory() {
                 const dateStr = new Date(d.startAt).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 
                 return `<tr>
-                    <td>${dateStr}</td>
-                    <td>${outT}</td>
-                    <td>${elIn}</td>
-                    <td>${htOut}</td>
-                    <td><strong>${cop}</strong></td>
+                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${dateStr}</td>
+                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${outT}</td>
+                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${elIn}</td>
+                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${htOut}</td>
+                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;"><strong>${cop}</strong></td>
                 </tr>`;
             }).join('');
         } else {
-            rows = `<tr><td colspan="5" style="text-align:center;">No history available for the last 12 weeks.</td></tr>`;
+            rows = `<tr><td colspan="5" style="text-align:center; padding:1rem;">No history available for the last 14 days.</td></tr>`;
         }
 
         viewPerformance.innerHTML = `
             <div class="card" style="margin: 0 auto;">
                 <div class="card-title">Daily Performance History</div>
+                ${totalHtml}
                 <div style="overflow-x: auto;">
                     <table style="width:100%; text-align:left; border-collapse: collapse;">
                         <thead>

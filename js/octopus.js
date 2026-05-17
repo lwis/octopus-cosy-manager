@@ -264,7 +264,7 @@ export class OctopusClient {
         };
     }
 
-    async gql(query, variables, authed, useBackend = false) {
+    async gql(query, variables, authed, useBackend = false, retry = true) {
         const headers = {
             'Content-Type': 'application/json'
         };
@@ -281,16 +281,27 @@ export class OctopusClient {
             body: JSON.stringify({ query, variables })
         });
 
+        if (response.status === 401 && authed && retry) {
+            await this.authenticate();
+            return this.gql(query, variables, authed, useBackend, false);
+        }
+
         const result = await response.json();
 
         if (result.errors && result.errors.length > 0) {
-            console.error('GraphQL Errors:', JSON.stringify(result.errors, null, 2));
             const details = result.errors.map(e => {
                 let msg = e.message;
                 if (e.path) msg += ` [path: ${e.path.join('.')}]`;
                 if (e.extensions) msg += ` [${JSON.stringify(e.extensions)}]`;
                 return msg;
             }).join('; ');
+
+            if (authed && retry && (details.toLowerCase().includes("token") || details.includes("401") || details.toLowerCase().includes("signature has expired"))) {
+                await this.authenticate();
+                return this.gql(query, variables, authed, useBackend, false);
+            }
+
+            console.error('GraphQL Errors:', JSON.stringify(result.errors, null, 2));
             throw new Error(details);
         }
 

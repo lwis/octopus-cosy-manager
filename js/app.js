@@ -17,7 +17,7 @@ const setupError = document.getElementById('setup-error');
 export function init() {
     const creds = loadCredentials();
     if (creds) {
-        client = new OctopusClient(creds.apiKey, creds.account, creds.euid);
+        client = new OctopusClient(creds.apiKey, creds.account, creds.euid, creds.propertyId);
         showDashboard();
     } else {
         showSetup();
@@ -31,8 +31,8 @@ function loadCredentials() {
     return data ? JSON.parse(data) : null;
 }
 
-function saveCredentials(apiKey, account, euid) {
-    localStorage.setItem('cosy_manager_creds', JSON.stringify({ apiKey, account, euid }));
+function saveCredentials(apiKey, account, euid, propertyId) {
+    localStorage.setItem('cosy_manager_creds', JSON.stringify({ apiKey, account, euid, propertyId }));
 }
 
 export function logout() {
@@ -251,7 +251,7 @@ function renderDashboard(config, livePerf) {
             <div class="card">
                 <div class="card-title">Controller & Hardware</div>
                 <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
-                    <strong>State:</strong> ${c.state?.join(', ') || 'Unknown'} <a href="javascript:void(0)" onclick="app.rebootController()" style="margin-left:.25rem;color:#e53e3e;">[Reboot]</a><br/>
+                    <strong>State:</strong> ${c.state?.join(', ') || 'Unknown'}<br/>
                     <strong>Smart Control:</strong> <a href="javascript:void(0)" onclick="app.setupSmartControl()" style="margin-left:.25rem;color:#4299e1;">[Setup]</a><br/>
                     <strong>HW Version:</strong> ${hp.hardwareVersion || 'Unknown'}<br/>
                     <strong>FW (ESP32):</strong> ${c.firmwareConfiguration?.esp32 || 'Unknown'}<br/>
@@ -271,7 +271,7 @@ function renderDashboard(config, livePerf) {
                 </div>
                 <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
                     ${flowTempHtml}<br/>
-                    <strong>Hot Water Setpoint:</strong> <a href="javascript:void(0)" onclick="app.editWaterSetpoint(${hp.minWaterSetpoint || 10}, ${hp.maxWaterSetpoint || 80})" style="margin-left:.25rem;color:#4299e1;">[Set Target Temp]</a> <span style="font-size:.8rem;color:#718096;">(Limits: ${hp.minWaterSetpoint || '-'}°C - ${hp.maxWaterSetpoint || '-'}°C)</span><br/>
+                    <strong>Hot Water Limits:</strong> ${hp.minWaterSetpoint || '-'}°C - ${hp.maxWaterSetpoint || '-'}°C<br/>
                     <strong>Weather Comp:</strong> ${wCompHtml}<br/>
                     <hr style="margin: .5rem 0; border: 0; border-top: 1px solid #e2e8f0;">
                     <strong>SCOP:</strong> ${p?.seasonalCoefficientOfPerformance ? parseFloat(p.seasonalCoefficientOfPerformance).toFixed(2) : 'N/A'}<br/>
@@ -424,8 +424,9 @@ function renderDashboard(config, livePerf) {
 function getZoneTypeBadge(type) {
     if (type === 'HEAT') return '<span class="badge">Heating</span>';
     if (type === 'WATER') return '<span class="badge water">Hot Water</span>';
-    if (type === 'AUX') return '<span class="badge aux">Auxiliary</span>';
-    if (type === 'EXT') return '<span class="badge aux">External</span>';
+    if (type === 'AUXILIARY') return '<span class="badge aux">Auxiliary</span>';
+    if (type === 'WIRED_THERMOSTAT') return '<span class="badge aux">Wired Thermostat</span>';
+    if (type === 'DIVERTER_VALVE') return '<span class="badge aux">Diverter Valve</span>';
     return '';
 }
 
@@ -660,16 +661,6 @@ export function toggleSetpoint(sel) {
     if (sel.value === 'OFF') sp.value = '';
 }
 
-export async function rebootController() {
-    if (!confirm("Are you sure you want to reboot the heat pump controller?")) return;
-    try {
-        await client.rebootController();
-        alert("Reboot initiated. It may take a few minutes.");
-    } catch (e) {
-        alert("Failed to reboot: " + e.message);
-    }
-}
-
 export async function toggleQuieterMode(enabled) {
     if (!confirm(`Turn quieter mode ${enabled ? 'ON' : 'OFF'}?`)) return;
     try {
@@ -677,19 +668,6 @@ export async function toggleQuieterMode(enabled) {
         await showDashboard(); // refresh
     } catch (e) {
         alert("Failed to toggle quieter mode: " + e.message);
-    }
-}
-
-export async function editWaterSetpoint(min, max) {
-    const val = prompt(`Enter new hot water setpoint (°C) between ${min} and ${max}:`);
-    if (val === null) return;
-    const n = parseInt(val, 10);
-    if (isNaN(n) || n < min || n > max) return alert(`Invalid setpoint (must be between ${min} and ${max})`);
-    try {
-        await client.updateWaterSetpoint(n);
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to update setpoint: " + e.message);
     }
 }
 

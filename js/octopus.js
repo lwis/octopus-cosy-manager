@@ -30,29 +30,54 @@ export class OctopusClient {
 
     async discoverDevices() {
         const viewerQuery = `
-            query GetViewerAccounts {
+            query ViewerQuery {
                 viewer {
                     accounts {
                         number
+                        ... on AccountType {
+                            properties {
+                                id
+                                electricityMeterPoints {
+                                    mpan
+                                    meters {
+                                        id
+                                        serialNumber
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }`;
         
-        const viewerData = await this.gql(viewerQuery, {}, true);
+        const viewerData = await this.gql(viewerQuery, {}, true, false);
         const accounts = viewerData?.viewer?.accounts || [];
         
         const devices = [];
         for (const account of accounts) {
-            const euidQuery = `
-                query GetHeatPumps($accountNumber: String!) {
-                    octoHeatPumpControllerEuids(accountNumber: $accountNumber)
-                }`;
-            
-            const euidData = await this.gql(euidQuery, { accountNumber: account.number }, true);
-            const euids = euidData?.octoHeatPumpControllerEuids || [];
-            
-            for (const euid of euids) {
-                devices.push({ account: account.number, euid });
+            const properties = account.properties || [];
+            for (const property of properties) {
+                const controllersQuery = `
+                    query GetHeatPumps($accountNumber: String!, $propertyId: ID!) {
+                        heatPumpControllersAtLocation(accountNumber: $accountNumber, propertyId: $propertyId) {
+                            controller { euid }
+                            location { propertyId }
+                        }
+                    }`;
+                
+                const data = await this.gql(controllersQuery, { 
+                    accountNumber: account.number, 
+                    propertyId: property.id 
+                }, true, true);
+                
+                const controllers = data?.heatPumpControllersAtLocation || [];
+                for (const ctrl of controllers) {
+                    devices.push({ 
+                        account: account.number, 
+                        euid: ctrl.controller?.euid,
+                        propertyId: ctrl.location?.propertyId || property.id
+                    });
+                }
             }
         }
         
@@ -274,21 +299,9 @@ export class OctopusClient {
 
     // --- Device Mutations ---
     
-    async rebootController() {
-        // Reboot not migrated to backend yet, keep hitting old endpoint
-        const query = `mutation($a: String!, $e: ID!) { octoHeatPumpRebootController(accountNumber: $a, euid: $e) { transactionId } }`;
-        return this.gql(query, { a: this.account, e: this.euid }, true, false);
-    }
-
     async setQuieterMode(enabled) {
         const query = `mutation($a: String!, $e: ID!, $q: Boolean!) { heatPumpSetHushMode(accountNumber: $a, euid: $e, hushModeEnabled: $q) { transactionId } }`;
         return this.gql(query, { a: this.account, e: this.euid, q: enabled }, true, true);
-    }
-
-    async updateWaterSetpoint(setpoint) {
-        // Hot water setpoint not in new schema, hitting old endpoint
-        const query = `mutation($a: String!, $e: ID!, $s: Int!) { octoHeatPumpUpdateWaterSetpoint(accountNumber: $a, euid: $e, setpoint: $s) { transactionId } }`;
-        return this.gql(query, { a: this.account, e: this.euid, s: parseInt(setpoint, 10) }, true, false);
     }
 
     async updateSensorDisplayName(sensorCode, displayName) {

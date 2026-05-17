@@ -71,9 +71,15 @@ export async function showDashboard() {
             await client.authenticate();
         }
         currentConfig = await client.getConfiguration();
-        // Fetch live performance concurrently, don't let it block the dashboard
+        
+        // Fetch live data concurrently
         let livePerf = null;
-        try { livePerf = await client.getLivePerformance(); } catch (e) { console.warn('Live perf unavailable:', e.message); }
+        try { 
+            livePerf = await client.getLivePerformance(); 
+        } catch (e) { 
+            console.warn('Live perf unavailable:', e.message); 
+        }
+
         renderDashboard(currentConfig, livePerf);
         startLiveRefresh();
         viewLoading.classList.add('hidden');

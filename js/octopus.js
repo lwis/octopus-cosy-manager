@@ -324,7 +324,15 @@ export class OctopusClient {
 
     async setupSmartControl() {
         if (!this.propertyId) throw new Error("Property ID not available to setup smart control.");
-        const query = `mutation($a: String!, $p: ID!, $e: ID!) { heatPumpSetupSmartControl(input: { accountNumber: $a, propertyId: $p, euid: $e }) { success } }`;
+        const query = `mutation($a: String!, $p: String!, $e: EUID!) {
+            octopusDeviceSetupSmartControl(input: {
+                accountNumber: $a
+                propertyId: $p
+                deviceId: { heatPumpIdentifier: $e }
+            }) {
+                success
+            }
+        }`;
         return this.gql(query, { a: this.account, p: this.propertyId, e: this.euid }, true, true);
     }
 
@@ -377,6 +385,37 @@ export class OctopusClient {
         }
 
         return this.gql(query, { accountNumber: this.account, euid: this.euid, input }, true, true);
+    }
+
+    // --- Device Metadata ---
+
+    // Device-level detail from the newer `octopusDevices` API. Supplementary:
+    // the dashboard renders without it, so callers should tolerate a null.
+    async getDeviceMetadata() {
+        const query = `query GetDeviceMetadata($accountNumber: String!, $propertyId: String) {
+            octopusDevices(accountNumber: $accountNumber, propertyId: $propertyId) {
+                deviceId
+                controlMode
+                currentLocation { propertyId }
+                onboarding { onboardedAt }
+                ... on HeatPumpControllerDevice {
+                    provisionedAt
+                    heatPumpModel
+                }
+            }
+        }`;
+
+        const data = await this.gql(query, {
+            accountNumber: this.account,
+            propertyId: this.propertyId
+        }, true, true);
+
+        const devices = data?.octopusDevices || [];
+        // `octopusDevices` returns every device at the property (EV chargers
+        // included), so match our controller by EUID before falling back.
+        return devices.find(d => d.deviceId === this.euid)
+            || devices.find(d => d.provisionedAt !== undefined)
+            || null;
     }
 
     // --- Live Performance ---

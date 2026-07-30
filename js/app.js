@@ -71,13 +71,20 @@ export async function showDashboard() {
             await client.authenticate();
         }
         currentConfig = await client.getConfiguration();
-        
+
+        // Device-level metadata is supplementary; render without it on failure.
+        try {
+            currentConfig.device = await client.getDeviceMetadata();
+        } catch (e) {
+            console.warn('Device metadata unavailable:', e.message);
+        }
+
         // Fetch live data concurrently
         let livePerf = null;
-        try { 
-            livePerf = await client.getLivePerformance(); 
-        } catch (e) { 
-            console.warn('Live perf unavailable:', e.message); 
+        try {
+            livePerf = await client.getLivePerformance();
+        } catch (e) {
+            console.warn('Live perf unavailable:', e.message);
         }
 
         renderDashboard(currentConfig, livePerf);
@@ -221,6 +228,17 @@ function renderDashboard(config, livePerf) {
     const hp = config.heatPump || {};
     const c = config.controller || {};
     const p = config.performance || {};
+    const d = config.device || {};
+
+    // controlMode reports whether Octopus is actively optimising the pump.
+    const controlModeHtml = d.controlMode === 'SMART'
+        ? '<span class="badge" style="background:#38a169;color:white;">Smart</span>'
+        : (d.controlMode === 'MANUAL' ? '<span class="badge">Manual</span>' : '<code>Unknown</code>');
+
+    const setupLink = `<a href="javascript:void(0)" onclick="app.setupSmartControl()" style="margin-left:.25rem;color:#4299e1;">[Setup]</a>`;
+    const smartControlHtml = d.controlMode === 'SMART'
+        ? '<code>Active</code>'
+        : setupLink;
 
     // safe getters
     const flowTemp = hp.heatingFlowTemperature?.currentTemperature?.value != null ? hp.heatingFlowTemperature.currentTemperature.value : '-';
@@ -257,12 +275,13 @@ function renderDashboard(config, livePerf) {
             <div class="card">
                 <div class="card-title">Controller & Hardware</div>
                 <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
-                    <strong>Control Mode:</strong> <code>${config.controlMode || 'Unknown'}</code><br/>
-                    <strong>Device ID:</strong> <code>${config.deviceId || 'Unknown'}</code><br/>
-                    <strong>Property ID:</strong> <code>${config.currentLocation?.propertyId || 'Unknown'}</code><br/>
-                    <strong>Provisioned:</strong> <code>${config.provisionedAt ? new Date(config.provisionedAt).toLocaleDateString() : 'Unknown'}</code><br/>
+                    <strong>Control Mode:</strong> ${controlModeHtml}<br/>
+                    <strong>Device ID:</strong> <code>${d.deviceId || 'Unknown'}</code><br/>
+                    <strong>Property ID:</strong> <code>${d.currentLocation?.propertyId || 'Unknown'}</code><br/>
+                    <strong>Provisioned:</strong> <code>${d.provisionedAt ? new Date(d.provisionedAt).toLocaleDateString() : 'Unknown'}</code><br/>
+                    <strong>Onboarded:</strong> <code>${d.onboarding?.onboardedAt ? new Date(d.onboarding.onboardedAt).toLocaleDateString() : 'Unknown'}</code><br/>
                     <strong>State:</strong> <code>${c.state?.join(', ') || 'Unknown'}</code><br/>
-                    <strong>Smart Control:</strong> <a href="javascript:void(0)" onclick="app.setupSmartControl()" style="margin-left:.25rem;color:#4299e1;">[Setup]</a><br/>
+                    <strong>Smart Control:</strong> ${smartControlHtml}<br/>
                     <strong>HW Version:</strong> <code>${hp.hardwareVersion || 'Unknown'}</code><br/>
                     <strong>FW (ESP32):</strong> <code>${c.firmwareConfiguration?.esp32 || 'Unknown'}</code><br/>
                     <strong>FW (EFR32):</strong> <code>${c.firmwareConfiguration?.efr32 || 'Unknown'}</code><br/>

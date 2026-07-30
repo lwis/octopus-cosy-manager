@@ -257,16 +257,20 @@ function renderDashboard(config, livePerf) {
             <div class="card">
                 <div class="card-title">Controller & Hardware</div>
                 <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
-                    <strong>State:</strong> ${c.state?.join(', ') || 'Unknown'}<br/>
+                    <strong>Control Mode:</strong> <code>${config.controlMode || 'Unknown'}</code><br/>
+                    <strong>Device ID:</strong> <code>${config.deviceId || 'Unknown'}</code><br/>
+                    <strong>Property ID:</strong> <code>${config.currentLocation?.propertyId || 'Unknown'}</code><br/>
+                    <strong>Provisioned:</strong> <code>${config.provisionedAt ? new Date(config.provisionedAt).toLocaleDateString() : 'Unknown'}</code><br/>
+                    <strong>State:</strong> <code>${c.state?.join(', ') || 'Unknown'}</code><br/>
                     <strong>Smart Control:</strong> <a href="javascript:void(0)" onclick="app.setupSmartControl()" style="margin-left:.25rem;color:#4299e1;">[Setup]</a><br/>
-                    <strong>HW Version:</strong> ${hp.hardwareVersion || 'Unknown'}<br/>
-                    <strong>FW (ESP32):</strong> ${c.firmwareConfiguration?.esp32 || 'Unknown'}<br/>
-                    <strong>FW (EFR32):</strong> ${c.firmwareConfiguration?.efr32 || 'Unknown'}<br/>
-                    <strong>EUI:</strong> ${c.firmwareConfiguration?.eui || 'Unknown'}<br/>
+                    <strong>HW Version:</strong> <code>${hp.hardwareVersion || 'Unknown'}</code><br/>
+                    <strong>FW (ESP32):</strong> <code>${c.firmwareConfiguration?.esp32 || 'Unknown'}</code><br/>
+                    <strong>FW (EFR32):</strong> <code>${c.firmwareConfiguration?.efr32 || 'Unknown'}</code><br/>
+                    <strong>EUI:</strong> <code>${c.firmwareConfiguration?.eui || 'Unknown'}</code><br/>
                     <strong>Password:</strong> <code>${c.accessPointPassword || '***'}</code><br/>
-                    <strong>Faults:</strong> ${hp.faultCodes?.length ? hp.faultCodes.join(', ') : 'None'}<br/>
-                    <strong>Quieter Mode:</strong> ${hp.quieterModeEnabled ? 'Yes' : 'No'} <a href="javascript:void(0)" onclick="app.toggleQuieterMode(${!hp.quieterModeEnabled})" style="margin-left:.25rem;color:#4299e1;">[Toggle]</a><br/>
-                    <strong>Last Reset:</strong> ${c.lastReset ? new Date(c.lastReset).toLocaleString() : 'Unknown'}
+                    <strong>Faults:</strong> <code>${hp.faultCodes?.length ? hp.faultCodes.join(', ') : 'None'}</code><br/>
+                    <strong>Quieter Mode:</strong> <code>${hp.quieterModeEnabled ? 'Yes' : 'No'}</code> <a href="javascript:void(0)" onclick="app.toggleQuieterMode(${!hp.quieterModeEnabled})" style="margin-left:.25rem;color:#4299e1;">[Toggle]</a><br/>
+                    <strong>Last Reset:</strong> <code>${c.lastReset ? new Date(c.lastReset).toLocaleString() : 'Unknown'}</code>
                 </div>
             </div>
             

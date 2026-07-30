@@ -11,7 +11,9 @@ Guidance for AI agents working on this codebase.
 - **`js/app.js`**: UI logic, view orchestration, and dashboard rendering.
   - **Live Auto-Refresh**: Uses `setInterval` (5s) to update `#live-performance-container` when the dashboard is visible.
   - **Lifecycle**: `showDashboard()` starts the refresh; `hideAllViews()` stops it.
-- **`js/octopus.js`**: GraphQL client for `api.octopus.energy/v1/graphql/` (auth) and `api.backend.octopus.energy/v1/graphql` (data).
+- **`js/octopus.js`**: GraphQL client using two endpoints:
+  - `api.octopus.energy/v1/graphql/` — auth only (`obtainKrakenToken`)
+  - `api.backend.octopus.energy/v1/graphql` — all heat pump queries and mutations
   - Maps API `SettingActions` (`SET_TEMPERATURE`/`TURN_OFF`) to UI modes (`"HEAT"`/`"OFF"`).
   - Handles JWT authentication and auto-discovery of EUIDs.
 - **`css/style.css`**: Styling framework.

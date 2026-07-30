@@ -92,11 +92,7 @@ export class OctopusClient {
                         accessPointPassword
                         connected
                         heatPumpTimezone
-                        firmwareConfiguration {
-                            efr32
-                            esp32
-                            eui
-                        }
+                        firmwareConfiguration { efr32 esp32 eui }
                         lastReset
                         state
                     }
@@ -145,12 +141,6 @@ export class OctopusClient {
                         }
                     }
                 }
-                heatPumpLifetimePerformance(accountNumber: $accountNumber, euid: $euid) {
-                    seasonalCoefficientOfPerformance
-                    heatOutput { unit value }
-                    energyInput { unit value }
-                    readAt
-                }
                 heatPumpControllerStatus(accountNumber: $accountNumber, euid: $euid) {
                     sensors {
                         code
@@ -162,6 +152,12 @@ export class OctopusClient {
                         telemetry { setpointInCelsius mode relaySwitchedOn heatDemand retrievedAt }
                     }
                 }
+                heatPumpLifetimePerformance(accountNumber: $accountNumber, euid: $euid) {
+                    seasonalCoefficientOfPerformance
+                    heatOutput { unit value }
+                    energyInput { unit value }
+                    readAt
+                }
             }`;
 
         const data = await this.gql(query, {
@@ -169,23 +165,29 @@ export class OctopusClient {
             euid: this.euid
         }, true, true);
 
-        if (!data.heatPumpControllerConfiguration) {
+        const hpConfig = data.heatPumpControllerConfiguration;
+        const status = data.heatPumpControllerStatus;
+
+        if (!hpConfig) {
             throw new Error("No configuration returned (check account number and EUID)");
         }
 
-        const config = data.heatPumpControllerConfiguration;
-        config.performance = data.heatPumpLifetimePerformance;
-        const status = data.heatPumpControllerStatus;
-        
-        // Merge schedules and telemetry into configuration for easier consumption
+        const config = {
+            controller: hpConfig.controller,
+            heatPump: hpConfig.heatPump,
+            zones: hpConfig.zones,
+            performance: data.heatPumpLifetimePerformance,
+        };
+
+        // Merge schedules and telemetry into zone configs for easier consumption
         config.zones.forEach(z => {
             z.configuration.schedules = (z.schedules || []).map(s => this.toSchedule(s));
-            
-            if (status && status.zones) {
+
+            if (status?.zones) {
                 const zStatus = status.zones.find(st => st.zone === z.configuration.code);
                 if (zStatus) z.configuration.telemetry = zStatus.telemetry;
             }
-            if (status && status.sensors && z.configuration.sensors) {
+            if (status?.sensors && z.configuration.sensors) {
                 z.configuration.sensors.forEach(s => {
                     const sStatus = status.sensors.find(st => st.code === s.code);
                     if (sStatus) {
@@ -316,8 +318,8 @@ export class OctopusClient {
     }
 
     async updateSensorDisplayName(sensorCode, displayName) {
-        const query = `mutation($a: String!, $e: ID!, $u: [UpdateSensorDisplayNameInput!]!) { heatPumpBulkUpdateSensorDisplayName(accountNumber: $a, euid: $e, updates: $u) { transactionId } }`;
-        return this.gql(query, { a: this.account, e: this.euid, u: [{ sensorCode, displayName }] }, true, true);
+        const query = `mutation($a: String!, $e: ID!, $u: [SensorDisplayNameUpdate!]!) { heatPumpBulkUpdateSensorDisplayName(accountNumber: $a, euid: $e, updates: $u) { transactionId } }`;
+        return this.gql(query, { a: this.account, e: this.euid, u: [{ sensorCode, newDisplayName: displayName }] }, true, true);
     }
 
     async setupSmartControl() {
@@ -332,32 +334,49 @@ export class OctopusClient {
     }
 
     async setZonePrimarySensor(zone, sensorCode) {
-        const query = `mutation { heatPumpSetZonePrimarySensor(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: {zone: ${zone}, sensorCode: "${sensorCode}"}) { transactionId } }`;
-        return this.gql(query, {}, true, true);
+        const query = `mutation SetZonePrimarySensor($accountNumber: String!, $euid: ID!, $params: SetZonePrimarySensorParameters!) {
+            heatPumpSetZonePrimarySensor(accountNumber: $accountNumber, euid: $euid, operationParameters: $params) {
+                transactionId
+            }
+        }`;
+        return this.gql(query, { accountNumber: this.account, euid: this.euid, params: { zone, sensorCode } }, true, true);
     }
 
     async setZoneMode(zone, mode, endAt, setpoint, action) {
-        let opArgs = `{zone: ${zone}`;
-        if (mode) opArgs += `, mode: ${mode}`;
-        if (action) opArgs += `, scheduleOverrideAction: ${action}`;
-        if (endAt) opArgs += `, endAt: "${endAt}"`;
-        if (setpoint) opArgs += `, setpointInCelsius: "${setpoint}"`;
-        opArgs += `}`;
-        
-        const query = `mutation { heatPumpSetZoneMode(accountNumber: "${this.account}", euid: "${this.euid}", operationParameters: ${opArgs}) { transactionId } }`;
-        return this.gql(query, {}, true, true);
+        const query = `mutation SetZoneMode($accountNumber: String!, $euid: ID!, $params: SetZoneModeParameters!) {
+            heatPumpSetZoneMode(accountNumber: $accountNumber, euid: $euid, operationParameters: $params) {
+                transactionId
+            }
+        }`;
+
+        const params = { zone };
+        if (mode) params.mode = mode;
+        if (action) params.scheduleOverrideAction = action;
+        if (endAt) params.endAt = endAt;
+        if (setpoint) params.setpointInCelsius = parseFloat(setpoint);
+
+        return this.gql(query, { accountNumber: this.account, euid: this.euid, params }, true, true);
     }
 
     async updateFlowTemperatureConfiguration(useWc, flowTemp, minTemp, maxTemp) {
-        let flowTempStr = flowTemp ? `"${flowTemp}"` : `""`;
-        let minTempStr = minTemp ? `"${minTemp}"` : `""`;
-        let maxTempStr = maxTemp ? `"${maxTemp}"` : `""`;
-        
-        let wcValues = `weatherCompensationValues: {minimum: {value: ${minTempStr}, unit: DEGREES_CELSIUS}, maximum: {value: ${maxTempStr}, unit: DEGREES_CELSIUS}}`;
-        let flowValues = `flowTemperature: {value: ${flowTempStr}, unit: DEGREES_CELSIUS}`;
-        
-        const query = `mutation { heatPumpUpdateFlowTemperatureConfiguration(accountNumber: "${this.account}", euid: "${this.euid}", flowTemperatureInput: {useWeatherCompensation: ${useWc}, ${flowValues}, ${wcValues}}) { transactionId } }`;
-        return this.gql(query, {}, true, true);
+        const query = `mutation UpdateFlowTemp($accountNumber: String!, $euid: ID!, $input: FlowTemperatureInput!) {
+            heatPumpUpdateFlowTemperatureConfiguration(accountNumber: $accountNumber, euid: $euid, flowTemperatureInput: $input) {
+                transactionId
+            }
+        }`;
+
+        const input = { useWeatherCompensation: useWc };
+        if (!useWc && flowTemp) {
+            input.flowTemperature = { value: parseFloat(flowTemp), unit: 'DEGREES_CELSIUS' };
+        }
+        if (useWc && minTemp && maxTemp) {
+            input.weatherCompensationValues = {
+                minimum: { value: parseFloat(minTemp), unit: 'DEGREES_CELSIUS' },
+                maximum: { value: parseFloat(maxTemp), unit: 'DEGREES_CELSIUS' },
+            };
+        }
+
+        return this.gql(query, { accountNumber: this.account, euid: this.euid, input }, true, true);
     }
 
     // --- Live Performance ---

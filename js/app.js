@@ -2,17 +2,20 @@ import { OctopusClient } from './octopus.js';
 
 let client = null;
 let currentConfig = null;
+let latestLive = null;
 let liveRefreshInterval = null;
 
 const viewLoading = document.getElementById('loading-view');
 const viewSetup = document.getElementById('setup-view');
 const viewDashboard = document.getElementById('dashboard-view');
 const viewEditZone = document.getElementById('edit-zone-view');
-const viewFlowTemp = document.getElementById('flow-temp-view');
 const viewZoneOverride = document.getElementById('zone-override-view');
 const viewPerformance = document.getElementById('performance-view');
 const logoutBtn = document.getElementById('logout-btn');
+const linkState = document.getElementById('link-state');
 const setupError = document.getElementById('setup-error');
+const toasts = document.getElementById('toasts');
+const dialog = document.getElementById('dialog');
 
 export function init() {
     const creds = loadCredentials();
@@ -24,6 +27,21 @@ export function init() {
     }
 
     document.getElementById('setup-form').addEventListener('submit', handleSetup);
+
+    // The schematic and the curve have separate wide and compact layouts.
+    let resizeTimer = null;
+    let wasCompact = isCompact();
+    window.addEventListener('resize', () => {
+        if (isCompact() === wasCompact) return;
+        wasCompact = isCompact();
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+            if (viewDashboard.classList.contains('hidden')) return;
+            const wrap = document.getElementById('schematic-wrap');
+            if (wrap) wrap.innerHTML = renderSchematicSvg(latestLive, currentConfig?.heatPump);
+            if (curveState && !curveState.dragging && !curveState.probing) repaintCurve();
+        }, 150);
+    });
 }
 
 function loadCredentials() {
@@ -39,8 +57,136 @@ export function logout() {
     localStorage.removeItem('cosy_manager_creds');
     client = null;
     currentConfig = null;
+    latestLive = null;
     showSetup();
 }
+
+// --- Shared UI ------------------------------------------------------------
+
+function esc(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+    ));
+}
+
+export function toast(message, tone = 'info') {
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.dataset.tone = tone;
+    el.innerHTML = `<span class="plate">${tone === 'error' ? 'Failed' : 'Done'}</span><span>${esc(message)}</span>`;
+    toasts.appendChild(el);
+    setTimeout(() => el.remove(), tone === 'error' ? 8000 : 4000);
+}
+
+// Resolves with the dialog form when confirmed, or null when dismissed.
+function openDialog({ title, bodyHtml = '', confirmLabel = 'Confirm', danger = false }) {
+    const form = document.getElementById('dialog-form');
+    const confirmBtn = document.getElementById('dialog-confirm');
+    document.getElementById('dialog-title').textContent = title;
+    document.getElementById('dialog-body').innerHTML = bodyHtml;
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.className = danger ? 'btn btn--danger' : 'btn btn--primary';
+
+    return new Promise(resolve => {
+        dialog.addEventListener('close', () => {
+            const confirmed = dialog.returnValue === 'confirm';
+            resolve(confirmed ? form : null);
+            form.reset();
+        }, { once: true });
+        dialog.showModal();
+        const field = form.querySelector('input, select, textarea');
+        if (field) field.focus();
+    });
+}
+
+async function confirmAction({ title, body, confirmLabel = 'Confirm', danger = false }) {
+    const result = await openDialog({ title, bodyHtml: `<p>${esc(body)}</p>`, confirmLabel, danger });
+    return result !== null;
+}
+
+async function promptForText({ title, label, value = '', confirmLabel = 'Save' }) {
+    const bodyHtml = `
+        <label class="field" style="margin-bottom:0;">
+            <span class="plate">${esc(label)}</span>
+            <input type="text" name="text" value="${esc(value)}" required maxlength="60">
+        </label>`;
+    const form = await openDialog({ title, bodyHtml, confirmLabel });
+    if (!form) return null;
+    return form.text.value.trim();
+}
+
+// Wraps a mutation: reports the outcome and reloads the dashboard on success.
+async function run(action, successMessage) {
+    try {
+        await action();
+        toast(successMessage);
+        await showDashboard();
+        return true;
+    } catch (e) {
+        toast(e.message, 'error');
+        return false;
+    }
+}
+
+// --- Formatting -----------------------------------------------------------
+
+const SENTINEL = -20; // The controller reports unset probes as large negatives.
+const isSentinel = t => t == null || parseFloat(t) < SENTINEL;
+
+const num = (v, dp = 1) => (v == null || isNaN(parseFloat(v)) ? null : parseFloat(v).toFixed(dp));
+const temp = (v, dp = 1) => (isSentinel(v) ? null : `${num(v, dp)}°`);
+
+function circuitVar(zoneType) {
+    if (zoneType === 'HEAT') return 'var(--heat)';
+    if (zoneType === 'WATER') return 'var(--water)';
+    return 'var(--aux)';
+}
+
+function circuitLabel(zoneType) {
+    return {
+        HEAT: 'Heating',
+        WATER: 'Hot water',
+        AUXILIARY: 'Auxiliary',
+        WIRED_THERMOSTAT: 'Wired stat',
+        DIVERTER_VALVE: 'Diverter',
+    }[zoneType] || 'Circuit';
+}
+
+function readAge(readAt) {
+    if (!readAt) return '';
+    const secs = Math.round((Date.now() - new Date(readAt)) / 1000);
+    if (secs < 60) return `${Math.max(secs, 0)}s ago`;
+    if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+    return `${Math.round(secs / 3600)}h ago`;
+}
+
+const dayNames = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+const dayInitials = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+// A zone's live reading: primary sensor if it has one, else its telemetry setpoint.
+function zoneReading(zone) {
+    const sensors = zone.sensors || [];
+    const primary = sensors.find(s => s.code === zone.primarySensor) || sensors[0];
+    const measured = primary?.telemetry?.temperatureInCelsius;
+    return {
+        measured: isSentinel(measured) ? null : parseFloat(measured),
+        target: zone.currentOperation?.setpointInCelsius ?? (isSentinel(zone.telemetry?.setpointInCelsius) ? null : zone.telemetry?.setpointInCelsius),
+    };
+}
+
+function zoneState(zone) {
+    const mode = zone.currentOperation?.mode;
+    const calling = zone.telemetry?.heatDemand || zone.heatDemand || zone.callForHeat;
+    if (calling) return 'calling';
+    if (mode === 'OFF' || zone.currentOperation?.action === 'TURN_OFF') return 'off';
+    return 'satisfied';
+}
+
+function activeZones(config) {
+    return (config.zones || []).map(z => z.configuration).filter(z => z.enabled);
+}
+
+// --- Views ----------------------------------------------------------------
 
 function hideAllViews() {
     stopLiveRefresh();
@@ -48,14 +194,14 @@ function hideAllViews() {
     viewSetup.classList.add('hidden');
     viewDashboard.classList.add('hidden');
     viewEditZone.classList.add('hidden');
-    if (viewFlowTemp) viewFlowTemp.classList.add('hidden');
-    if (viewZoneOverride) viewZoneOverride.classList.add('hidden');
-    if (viewPerformance) viewPerformance.classList.add('hidden');
+    viewZoneOverride.classList.add('hidden');
+    viewPerformance.classList.add('hidden');
     logoutBtn.classList.add('hidden');
 }
 
 function showSetup() {
     hideAllViews();
+    linkState.classList.add('hidden');
     document.getElementById('setup-form').classList.remove('hidden');
     document.getElementById('device-selection').classList.add('hidden');
     viewSetup.classList.remove('hidden');
@@ -67,9 +213,7 @@ export async function showDashboard() {
     logoutBtn.classList.remove('hidden');
 
     try {
-        if (!client.token) {
-            await client.authenticate();
-        }
+        if (!client.token) await client.authenticate();
         currentConfig = await client.getConfiguration();
 
         // Device-level metadata is supplementary; render without it on failure.
@@ -79,25 +223,25 @@ export async function showDashboard() {
             console.warn('Device metadata unavailable:', e.message);
         }
 
-        // Fetch live data concurrently
-        let livePerf = null;
         try {
-            livePerf = await client.getLivePerformance();
+            latestLive = await client.getLivePerformance();
         } catch (e) {
-            console.warn('Live perf unavailable:', e.message);
+            console.warn('Live performance unavailable:', e.message);
+            latestLive = null;
         }
 
-        renderDashboard(currentConfig, livePerf);
+        renderDashboard(currentConfig, latestLive);
         startLiveRefresh();
         viewLoading.classList.add('hidden');
         viewDashboard.classList.remove('hidden');
     } catch (err) {
         console.error(err);
-        alert("Failed to load dashboard: " + err.message);
-        if (err.message.includes("token") || err.message.includes("401")) {
+        if (err.message.includes('token') || err.message.includes('401')) {
+            toast('Session expired. Connect again.', 'error');
             logout();
         } else {
-            viewLoading.innerText = "Error: " + err.message;
+            viewLoading.textContent = err.message;
+            toast(err.message, 'error');
         }
     }
 }
@@ -108,24 +252,24 @@ async function handleSetup(e) {
 
     setupError.classList.add('hidden');
     const setupBtn = document.getElementById('setup-btn');
-    setupBtn.textContent = 'Connecting...';
+    setupBtn.textContent = 'Connecting…';
     setupBtn.disabled = true;
 
     try {
         const tempClient = new OctopusClient(apiKey, '', '');
         await tempClient.authenticate();
 
-        setupBtn.textContent = 'Discovering devices...';
+        setupBtn.textContent = 'Finding heat pumps…';
         const devices = await tempClient.discoverDevices();
 
         if (devices.length === 0) {
-            throw new Error("No heat pumps found on your account.");
+            throw new Error('No heat pumps on this account.');
         } else if (devices.length === 1) {
             finishSetup(apiKey, devices[0].account, devices[0].euid, devices[0].propertyId, tempClient);
         } else {
             const deviceSelector = document.getElementById('device-selector');
             deviceSelector.innerHTML = devices.map(d =>
-                `<option value='${JSON.stringify(d)}'>Account ${d.account} - Device ${d.euid}</option>`
+                `<option value='${esc(JSON.stringify(d))}'>Account ${esc(d.account)} · ${esc(d.euid)}</option>`
             ).join('');
             document.getElementById('setup-form').classList.add('hidden');
             document.getElementById('device-selection').classList.remove('hidden');
@@ -154,53 +298,744 @@ async function finishSetup(apiKey, account, euid, propertyId, tempClient) {
         client = tempClient;
         showDashboard();
     } catch (err) {
-        setupError.textContent = "Failed to load heat pump data: " + err.message;
+        setupError.textContent = err.message;
         setupError.classList.remove('hidden');
     }
 }
 
-// --- Dashboard Rendering ---
+// --- Schematic ------------------------------------------------------------
+// The hero: outdoor air in, electricity in, heat out to the circuits. The two
+// energy bars are drawn to the same scale, so COP reads as length before it
+// reads as a number.
 
-function renderLivePerformance(livePerf) {
-    if (!livePerf) return '';
+const SCHEMATIC = {
+    w: 1000,
+    h: 212,
+    flowY: 46,
+    // Clears the efficiency row, whose 19px type reaches y=175.
+    loopY: 190,
+    dropX: 4,
+    barX: 372,
+    barMaxW: 500,
+    barH: 12,
+    // Optical centre lines for electricity, heat and the efficiency readout.
+    rowY: [104, 134, 164],
+};
 
-    const cop = livePerf.coefficientOfPerformance ? parseFloat(livePerf.coefficientOfPerformance).toFixed(2) : '-';
-    const pIn = livePerf.powerInput?.value ? parseFloat(livePerf.powerInput.value).toFixed(2) + ' kW' : '-';
-    const hOut = livePerf.heatOutput?.value ? parseFloat(livePerf.heatOutput.value).toFixed(2) + ' kW' : '-';
-    const outT = livePerf.outdoorTemperature?.value != null ? parseFloat(livePerf.outdoorTemperature.value).toFixed(1) + '°C' : '-';
-    const age = livePerf.readAt ? Math.round((Date.now() - new Date(livePerf.readAt)) / 60000) : null;
-    const ageStr = age !== null ? (age < 2 ? 'Just now' : `${age}m ago`) : '';
+// Mirrors the .s-plate / .s-val sizes in style.css. The wide diagram only
+// renders above 720px, so the mobile type scale never applies to it.
+const S_TYPE = { plate: 9, val: 15, cop: 19 };
+
+// IBM Plex Mono caps and digits stand ~0.70em tall, so their ink sits half of
+// that above the baseline. Centring on the ink rather than the baseline is what
+// makes a 9px label, a 12px bar and a 15px number read as one row.
+const baseline = (centreY, fontPx) => centreY + fontPx * 0.35;
+
+// On a phone the diagram turns the corner: source and pump across the top,
+// the balance stacked underneath, flow running down the left edge as before.
+const SCHEMATIC_COMPACT = {
+    w: 420,
+    h: 300,
+    barX: 20,
+    barMaxW: 380,
+};
+
+const isCompact = () => window.matchMedia('(max-width: 720px)').matches;
+
+function renderSchematicSvg(livePerf, heatPump) {
+    return isCompact()
+        ? renderSchematicCompact(livePerf, heatPump)
+        : renderSchematicWide(livePerf, heatPump);
+}
+
+// Shared numbers for both layouts.
+function schematicFigures(livePerf, heatPump) {
+    const pIn = parseFloat(livePerf?.powerInput?.value) || 0;
+    const hOut = parseFloat(livePerf?.heatOutput?.value) || 0;
+    const running = hOut > 0.05;
+    return {
+        outdoor: livePerf?.outdoorTemperature?.value,
+        flowTemp: heatPump?.heatingFlowTemperature?.currentTemperature?.value,
+        cop: parseFloat(livePerf?.coefficientOfPerformance),
+        pIn,
+        hOut,
+        running,
+        period: running ? Math.min(Math.max(3.4 - hOut * 0.4, 0.55), 3.4) : 2,
+    };
+}
+
+function schematicLabel(figures) {
+    return `Heat pump flow diagram. Outdoor air ${figures.outdoor != null ? num(figures.outdoor) : 'unknown'} degrees, ` +
+        `${figures.pIn.toFixed(2)} kilowatts electricity in, ${figures.hOut.toFixed(2)} kilowatts heat out.`;
+}
+
+function renderSchematicCompact(livePerf, heatPump) {
+    const s = SCHEMATIC_COMPACT;
+    const f = schematicFigures(livePerf, heatPump);
+    const perKw = s.barMaxW / Math.max(f.hOut, f.pIn, 3);
+    const inW = Math.max(f.pIn * perKw, f.pIn > 0 ? 2 : 0);
+    const outW = Math.max(f.hOut * perKw, f.hOut > 0 ? 2 : 0);
+
+    const bar = (y, label, width, value, cls) => `
+      <text class="s-plate" x="${s.barX}" y="${y}">${label}</text>
+      <text class="s-val" x="${s.w - 8}" y="${y}" text-anchor="end">${value}<tspan class="s-unit"> kW</tspan></text>
+      <rect class="${cls}" x="${s.barX}" y="${y + 10}" width="${width}" height="12" />`;
 
     return `
-        <div style="background:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.05);padding:1.25rem 1.75rem;margin-bottom:2rem;">
-            <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:.9rem;">
-                <span style="font-size:1rem;font-weight:600;color:#2d3748;">⚡ Live</span>
-                ${ageStr ? `<span style="font-size:.75rem;color:#a0aec0;">${ageStr}</span>` : ''}
+    <svg class="schematic" viewBox="0 0 ${s.w} ${s.h}" role="img"
+         style="--flow-period:${f.period}s" aria-label="${esc(schematicLabel(f))}">
+      <text class="s-plate" x="0" y="18">Outdoor air</text>
+      <text class="s-val s-val--lg" x="0" y="52">${temp(f.outdoor) ?? '––'}</text>
+
+      <rect class="s-box" x="250" y="8" width="170" height="56" />
+      <text class="s-plate" x="335" y="30" text-anchor="middle">Pump</text>
+      <text class="s-val" x="335" y="52" text-anchor="middle">${f.running ? 'RUN' : 'IDLE'}</text>
+
+      <path class="s-flow" data-state="${f.running ? 'running' : 'idle'}"
+            d="M 335 64 V 92 H 4 V ${s.h}" />
+
+      <text class="s-plate" x="${s.barX}" y="124">Flow to circuits</text>
+      <text class="s-val" x="${s.w - 8}" y="124" text-anchor="end">${temp(f.flowTemp, 0) ?? '––'}</text>
+
+      ${bar(160, 'Electricity in', inW, f.pIn.toFixed(2), 's-bar-in')}
+      ${bar(212, 'Heat out', outW, f.hOut.toFixed(2), 's-bar-out')}
+
+      <text class="s-plate" x="${s.barX}" y="272">Heat per unit of electricity</text>
+      <text class="s-val" x="${s.w - 8}" y="272" text-anchor="end">${f.cop ? `${f.cop.toFixed(2)}<tspan class="s-unit"> ×</tspan>` : '––'}</text>
+    </svg>`;
+}
+
+function renderSchematicWide(livePerf, heatPump) {
+    const s = SCHEMATIC;
+    const outdoor = livePerf?.outdoorTemperature?.value;
+    const pIn = parseFloat(livePerf?.powerInput?.value) || 0;
+    const hOut = parseFloat(livePerf?.heatOutput?.value) || 0;
+    const cop = parseFloat(livePerf?.coefficientOfPerformance);
+    const flowTemp = heatPump?.heatingFlowTemperature?.currentTemperature?.value;
+    const running = hOut > 0.05;
+
+    // Both bars share a scale, so their lengths are directly comparable.
+    const perKw = s.barMaxW / Math.max(hOut, pIn, 3);
+    const inW = Math.max(pIn * perKw, pIn > 0 ? 2 : 0);
+    const outW = Math.max(hOut * perKw, hOut > 0 ? 2 : 0);
+    const period = running ? Math.min(Math.max(3.4 - hOut * 0.4, 0.55), 3.4) : 2;
+
+    const flowPath = `M 214 ${s.flowY} H ${s.w - 24} V ${s.loopY} H ${s.dropX} V ${s.h}`;
+
+    // Label, bar and number all hang off one centre line.
+    const bar = (cy, label, width, value, cls) => `
+      <g>
+        <text class="s-plate" x="${s.barX - 16}" y="${baseline(cy, S_TYPE.plate)}" text-anchor="end">${label}</text>
+        <rect class="${cls}" x="${s.barX}" y="${cy - s.barH / 2}" width="${width}" height="${s.barH}" />
+        <text class="s-val" x="${s.barX + width + 12}" y="${baseline(cy, S_TYPE.val)}">${value}<tspan class="s-unit"> kW</tspan></text>
+      </g>`;
+
+    return `
+    <svg class="schematic" viewBox="0 0 ${s.w} ${s.h}" role="img"
+         style="--flow-period:${period}s"
+         aria-label="Heat pump flow diagram. Outdoor air ${outdoor != null ? num(outdoor) : 'unknown'} degrees, ${pIn.toFixed(2)} kilowatts electricity in, ${hOut.toFixed(2)} kilowatts heat out.">
+      <text class="s-plate" x="0" y="16">Outdoor air</text>
+      <text class="s-val s-val--lg" x="0" y="46">${temp(outdoor) ?? '––'}</text>
+      <path class="s-line" d="M 88 40 H 118" marker-end="url(#tip)" />
+
+      <rect class="s-box" x="126" y="${s.flowY - 32}" width="88" height="64" />
+      <text class="s-plate" x="170" y="${s.flowY - 12}" text-anchor="middle">Pump</text>
+      <text class="s-val" x="170" y="${s.flowY + 12}" text-anchor="middle" style="font-size:13px">${running ? 'RUN' : 'IDLE'}</text>
+
+      <path class="s-flow" data-state="${running ? 'running' : 'idle'}" d="${flowPath}" />
+
+      <text class="s-plate" x="230" y="${s.flowY - 14}">Flow to circuits</text>
+      <text class="s-val" x="342" y="${s.flowY - 13}">${temp(flowTemp, 0) ?? '––'}</text>
+
+      ${bar(s.rowY[0], 'Electricity in', inW, pIn.toFixed(2), 's-bar-in')}
+      ${bar(s.rowY[1], 'Heat out', outW, hOut.toFixed(2), 's-bar-out')}
+
+      <text class="s-plate" x="${s.barX - 16}" y="${baseline(s.rowY[2], S_TYPE.plate)}" text-anchor="end">Efficiency now</text>
+      <text class="s-val" x="${s.barX}" y="${baseline(s.rowY[2], S_TYPE.cop)}" style="font-size:${S_TYPE.cop}px">${cop ? `${cop.toFixed(2)}<tspan class="s-unit"> × more heat than electricity</tspan>` : '––'}</text>
+
+      <defs>
+        <marker id="tip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-40)" />
+        </marker>
+      </defs>
+    </svg>`;
+}
+
+function renderBranches(config) {
+    return activeZones(config).map(zone => {
+        const state = zoneState(zone);
+        const { measured, target } = zoneReading(zone);
+        const stateTag = {
+            calling: '<span class="tag tag--solid tag--circuit">Calling for heat</span>',
+            satisfied: '<span class="tag">Satisfied</span>',
+            off: '<span class="tag tag--dim">Off</span>',
+        }[state];
+
+        return `
+        <div class="branch" data-state="${state}" style="--circuit:${circuitVar(zone.zoneType)}">
+            <div class="branch-id">
+                <span class="branch-name">${esc(zone.displayName || zone.code)}</span>
+                <span class="tag tag--circuit">${circuitLabel(zone.zoneType)}</span>
+                ${stateTag}
+                ${zone.emergency ? '<span class="tag tag--warn">Emergency</span>' : ''}
             </div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1rem;">
-                <div class="live-stat">
-                    <div class="live-stat-label">COP</div>
-                    <div class="live-stat-value">${cop}</div>
-                </div>
-                <div class="live-stat">
-                    <div class="live-stat-label">Power In</div>
-                    <div class="live-stat-value">${pIn}</div>
-                </div>
-                <div class="live-stat">
-                    <div class="live-stat-label">Heat Out</div>
-                    <div class="live-stat-value">${hOut}</div>
-                </div>
-                <div class="live-stat">
-                    <div class="live-stat-label">Outdoor Temp</div>
-                    <div class="live-stat-value">${outT}</div>
-                </div>
+            <div class="branch-read">
+                ${measured != null ? `<span>${measured.toFixed(1)}°</span>` : ''}
+                ${target != null ? `<span class="to">→ ${Number(target).toFixed(1)}°</span>` : ''}
+                ${measured == null && target == null ? '<span class="to">No reading</span>' : ''}
+            </div>
+            <div class="branch-actions">
+                <button class="btn btn--quiet btn--sm" onclick="app.showZoneOverride('${esc(zone.code)}')">Override</button>
+                <button class="btn btn--quiet btn--sm" onclick="app.showEditZone('${esc(zone.code)}')">Schedule</button>
             </div>
         </div>`;
+    }).join('');
 }
+
+// --- Weather compensation curve -------------------------------------------
+// Same ink as the schematic: the flow line drops out of the diagram and lands
+// on this axis. Drag the ends to set the policy; nothing is sent until Save.
+
+const CURVE = {
+    w: 720,
+    h: 300,
+    padL: 46,
+    padR: 26,
+    padT: 22,
+    padB: 40,
+    xMin: -8,
+    xMax: 18,
+    yMin: 20,
+    yMax: 60,
+};
+
+let curveState = null;
+
+function curveX(t) {
+    const c = CURVE;
+    return c.padL + ((t - c.xMin) / (c.xMax - c.xMin)) * (c.w - c.padL - c.padR);
+}
+
+function curveY(t) {
+    const c = CURVE;
+    return c.padT + (1 - (t - c.yMin) / (c.yMax - c.yMin)) * (c.h - c.padT - c.padB);
+}
+
+function curveTempFromY(y) {
+    const c = CURVE;
+    const frac = 1 - (y - c.padT) / (c.h - c.padT - c.padB);
+    return c.yMin + frac * (c.yMax - c.yMin);
+}
+
+function curveTempFromX(x) {
+    const c = CURVE;
+    const frac = (x - c.padL) / (c.w - c.padL - c.padR);
+    return clamp(c.xMin + frac * (c.xMax - c.xMin), c.xMin, c.xMax);
+}
+
+function initCurveState(heatPump) {
+    const wc = heatPump?.weatherCompensation || {};
+    const fixed = heatPump?.heatingFlowTemperature?.currentTemperature?.value;
+    const saved = {
+        useWc: !!wc.enabled,
+        min: parseFloat(wc.currentRange?.minimum?.value ?? 25),
+        max: parseFloat(wc.currentRange?.maximum?.value ?? 50),
+        fixed: parseFloat(fixed ?? 45),
+    };
+    curveState = {
+        saved,
+        draft: { ...saved },
+        limits: {
+            min: {
+                lo: parseFloat(wc.allowableMinimumTemperatureRange?.minimum?.value ?? CURVE.yMin),
+                hi: parseFloat(wc.allowableMinimumTemperatureRange?.maximum?.value ?? CURVE.yMax),
+            },
+            max: {
+                lo: parseFloat(wc.allowableMaximumTemperatureRange?.minimum?.value ?? CURVE.yMin),
+                hi: parseFloat(wc.allowableMaximumTemperatureRange?.maximum?.value ?? CURVE.yMax),
+            },
+            fixed: {
+                lo: parseFloat(heatPump?.heatingFlowTemperature?.allowableRange?.minimum?.value ?? CURVE.yMin),
+                hi: parseFloat(heatPump?.heatingFlowTemperature?.allowableRange?.maximum?.value ?? CURVE.yMax),
+            },
+        },
+        dragging: null,
+        probing: false,
+        saving: false,
+    };
+}
+
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+function curveIsDirty() {
+    const { saved, draft } = curveState;
+    if (saved.useWc !== draft.useWc) return true;
+    return draft.useWc
+        ? draft.min !== saved.min || draft.max !== saved.max
+        : draft.fixed !== saved.fixed;
+}
+
+// Flow the pump should run at, under a given policy, when it is t outside.
+// The Now marker and the hover probe both read the line through here.
+function policyFlowAt(policy, t) {
+    const c = CURVE;
+    if (!policy.useWc) return policy.fixed;
+    const frac = (clamp(t, c.xMin, c.xMax) - c.xMin) / (c.xMax - c.xMin);
+    return policy.max + (policy.min - policy.max) * frac;
+}
+
+function policyPath(policy) {
+    const c = CURVE;
+    if (!policy.useWc) {
+        return `M ${curveX(c.xMin)} ${curveY(policy.fixed)} H ${curveX(c.xMax)}`;
+    }
+    return `M ${curveX(c.xMin)} ${curveY(policy.max)} L ${curveX(c.xMax)} ${curveY(policy.min)}`;
+}
+
+function renderCurveSvg(livePerf) {
+    const c = CURVE;
+    // The plot keeps its height on a phone and loses width, so the labels and
+    // handles stay finger- and eye-sized.
+    c.w = isCompact() ? 420 : 720;
+    c.padL = isCompact() ? 40 : 46;
+    const { draft, saved, limits } = curveState;
+    const outdoor = livePerf?.outdoorTemperature?.value;
+    const nowX = outdoor != null ? curveX(clamp(parseFloat(outdoor), c.xMin, c.xMax)) : null;
+
+    const nowY = outdoor != null
+        ? curveY(clamp(policyFlowAt(draft, parseFloat(outdoor)), c.yMin, c.yMax))
+        : null;
+
+    const xTicks = isCompact() ? [-5, 5, 15] : [-5, 0, 5, 10, 15];
+    const yTicks = [25, 35, 45, 55];
+
+    const grid = [
+        ...xTicks.map(t => `<line class="c-grid" x1="${curveX(t)}" y1="${c.padT}" x2="${curveX(t)}" y2="${c.h - c.padB}" />`),
+        ...yTicks.map(t => `<line class="c-grid" x1="${c.padL}" y1="${curveY(t)}" x2="${c.w - c.padR}" y2="${curveY(t)}" />`),
+    ].join('');
+
+    const labels = [
+        ...xTicks.map(t => `<text x="${curveX(t)}" y="${c.h - c.padB + 16}" text-anchor="middle">${t}</text>`),
+        ...yTicks.map(t => `<text x="${c.padL - 10}" y="${curveY(t) + 3}" text-anchor="end">${t}</text>`),
+    ].join('');
+
+    const handles = draft.useWc
+        ? `
+        <circle class="c-handle" tabindex="0" role="slider" data-handle="max"
+                aria-label="Flow temperature at ${c.xMin} degrees outdoors"
+                aria-valuemin="${limits.max.lo}" aria-valuemax="${limits.max.hi}" aria-valuenow="${draft.max}"
+                cx="${curveX(c.xMin)}" cy="${curveY(draft.max)}" r="8" />
+        <circle class="c-handle" tabindex="0" role="slider" data-handle="min"
+                aria-label="Flow temperature at ${c.xMax} degrees outdoors"
+                aria-valuemin="${limits.min.lo}" aria-valuemax="${limits.min.hi}" aria-valuenow="${draft.min}"
+                cx="${curveX(c.xMax)}" cy="${curveY(draft.min)}" r="8" />
+        <text class="c-readout" data-readout="max" x="${curveX(c.xMin) + 14}" y="${curveY(draft.max) - 10}">${draft.max.toFixed(0)}°</text>
+        <text class="c-readout" data-readout="min" x="${curveX(c.xMax) - 14}" y="${curveY(draft.min) - 10}" text-anchor="end">${draft.min.toFixed(0)}°</text>`
+        : `
+        <circle class="c-handle" tabindex="0" role="slider" data-handle="fixed"
+                aria-label="Fixed flow temperature"
+                aria-valuemin="${limits.fixed.lo}" aria-valuemax="${limits.fixed.hi}" aria-valuenow="${draft.fixed}"
+                cx="${curveX(c.xMin)}" cy="${curveY(draft.fixed)}" r="8" />
+        <text class="c-readout" data-readout="fixed" x="${curveX(c.xMin) + 14}" y="${curveY(draft.fixed) - 10}">${draft.fixed.toFixed(0)}°</text>`;
+
+    return `
+    <svg class="curve" viewBox="0 0 ${c.w} ${c.h}" role="group"
+         aria-label="Flow temperature against outdoor temperature">
+      <path class="c-drop" d="M 4 0 V ${c.h - c.padB} H ${c.padL}" />
+      ${grid}
+      <line class="c-axis" x1="${c.padL}" y1="${c.padT}" x2="${c.padL}" y2="${c.h - c.padB}" />
+      <line class="c-axis" x1="${c.padL}" y1="${c.h - c.padB}" x2="${c.w - c.padR}" y2="${c.h - c.padB}" />
+      ${labels}
+      <text x="${c.padL - 10}" y="${c.padT - 8}" text-anchor="end">°C</text>
+      <text x="${c.w - c.padR}" y="${c.h - 8}" text-anchor="end">Outdoor °C</text>
+      ${curveIsDirty() ? `<path class="c-saved" d="${policyPath(saved)}" />` : ''}
+      <path class="c-live" d="${policyPath(draft)}" />
+      ${nowX != null ? `
+        <line class="c-drop" x1="${nowX}" y1="${nowY}" x2="${nowX}" y2="${c.h - c.padB}" />
+        <circle class="c-now-ring" cx="${nowX}" cy="${nowY}" r="11" />
+        <circle class="c-now" cx="${nowX}" cy="${nowY}" r="4" />
+        <text class="c-readout" x="${nowX + 14}" y="${nowY + 4}">Now</text>` : ''}
+      ${handles}
+      <g class="c-probe" data-on="false" aria-hidden="true">
+        <line class="c-probe-guide" x1="0" y1="${c.padT}" x2="0" y2="${c.h - c.padB}" />
+        <path class="c-probe-cross" d="" />
+        <circle class="c-probe-dot" cx="0" cy="0" r="3" />
+        <text class="c-probe-read" x="0" y="0"><tspan class="c-probe-out" data-probe="out"></tspan><tspan data-probe="flow" dx="4"></tspan></text>
+      </g>
+    </svg>`;
+}
+
+function renderCurveSheet(livePerf) {
+    const { draft } = curveState;
+    const dirty = curveIsDirty();
+    const summary = draft.useWc
+        ? `Flow follows the weather: ${draft.max.toFixed(0)}° when it's ${CURVE.xMin}° out, ${draft.min.toFixed(0)}° when it's ${CURVE.xMax}° out.`
+        : `Flow holds at ${draft.fixed.toFixed(0)}° whatever the weather.`;
+
+    return `
+    <section class="sheet" id="curve-sheet">
+        <div class="sheet-head">
+            <span class="plate">Flow policy</span>
+            <div class="head-actions">
+                <button class="btn btn--sm ${draft.useWc ? 'btn--primary' : 'btn--quiet'}" onclick="app.setCurveMode(true)">Weather</button>
+                <button class="btn btn--sm ${draft.useWc ? 'btn--quiet' : 'btn--primary'}" onclick="app.setCurveMode(false)">Fixed</button>
+            </div>
+        </div>
+        <div class="curve-wrap" id="curve-wrap">${renderCurveSvg(livePerf)}</div>
+        <div class="curve-foot">
+            <span class="prose" style="margin:0">${esc(summary)}</span>
+            <div class="actions">
+                <button class="btn btn--quiet btn--sm" onclick="app.resetCurve()" ${dirty ? '' : 'disabled'}>Discard</button>
+                <button class="btn btn--primary btn--sm" onclick="app.saveCurve()" ${dirty ? '' : 'disabled'}>Save policy</button>
+            </div>
+        </div>
+    </section>`;
+}
+
+function repaintCurve() {
+    const sheet = document.getElementById('curve-sheet');
+    if (!sheet) return;
+    sheet.outerHTML = renderCurveSheet(latestLive);
+    bindCurve();
+}
+
+// Dragging moves SVG attributes directly, so the pointer keeps its capture and
+// the sheet only re-renders (to refresh Save/Discard) once the drag ends.
+function bindCurve() {
+    const svg = document.querySelector('#curve-wrap .curve');
+    if (!svg) return;
+
+    const setValue = (name, value) => {
+        const { lo, hi } = curveState.limits[name];
+        const next = Math.round(clamp(value, lo, hi));
+        if (next === curveState.draft[name]) return false;
+        curveState.draft[name] = next;
+        return true;
+    };
+
+    const paintDrag = () => {
+        const { draft } = curveState;
+        svg.querySelector('.c-live').setAttribute('d', policyPath(draft));
+        svg.querySelectorAll('.c-handle').forEach(h => {
+            const value = draft[h.dataset.handle];
+            h.setAttribute('cy', curveY(value));
+            h.setAttribute('aria-valuenow', value);
+        });
+        svg.querySelectorAll('.c-readout[data-readout]').forEach(readout => {
+            const value = draft[readout.dataset.readout];
+            readout.setAttribute('y', curveY(value) - 10);
+            readout.textContent = `${value.toFixed(0)}°`;
+        });
+    };
+
+    svg.querySelectorAll('.c-handle').forEach(handle => {
+        const name = handle.dataset.handle;
+
+        handle.addEventListener('pointerdown', e => {
+            e.preventDefault();
+            curveState.dragging = name;
+            handle.setPointerCapture(e.pointerId);
+        });
+
+        handle.addEventListener('pointermove', e => {
+            if (curveState.dragging !== name) return;
+            const pt = svg.createSVGPoint();
+            pt.x = e.clientX;
+            pt.y = e.clientY;
+            const local = pt.matrixTransform(svg.getScreenCTM().inverse());
+            if (setValue(name, curveTempFromY(local.y))) paintDrag();
+        });
+
+        const endDrag = () => {
+            if (curveState.dragging !== name) return;
+            curveState.dragging = null;
+            repaintCurve();
+        };
+        handle.addEventListener('pointerup', endDrag);
+        handle.addEventListener('pointercancel', endDrag);
+
+        handle.addEventListener('keydown', e => {
+            const step = e.shiftKey ? 5 : 1;
+            const up = e.key === 'ArrowUp' || e.key === 'ArrowRight';
+            const down = e.key === 'ArrowDown' || e.key === 'ArrowLeft';
+            if (!up && !down) return;
+            e.preventDefault();
+            if (setValue(name, curveState.draft[name] + (up ? step : -step))) {
+                repaintCurve();
+                document.querySelector(`.c-handle[data-handle="${name}"]`)?.focus();
+            }
+        });
+    });
+
+    bindCurveProbe(svg);
+}
+
+// Hovering the plot reads the policy back: a crosshair where the pointer is,
+// and a dot on the line showing the flow temperature it would ask for there.
+// Hover-capable pointers only, so touch keeps the plot's drag gestures.
+function bindCurveProbe(svg) {
+    const probe = svg.querySelector('.c-probe');
+    if (!probe || !matchMedia('(hover: hover)').matches) return;
+
+    const guide = probe.querySelector('.c-probe-guide');
+    const cross = probe.querySelector('.c-probe-cross');
+    const dot = probe.querySelector('.c-probe-dot');
+    const read = probe.querySelector('.c-probe-read');
+    const outText = probe.querySelector('[data-probe="out"]');
+    const flowText = probe.querySelector('[data-probe="flow"]');
+
+    const hide = () => {
+        probe.dataset.on = 'false';
+        curveState.probing = false;
+    };
+
+    svg.addEventListener('pointermove', e => {
+        const c = CURVE;
+        if (curveState.dragging) {
+            hide();
+            return;
+        }
+
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX;
+        pt.y = e.clientY;
+        const local = pt.matrixTransform(svg.getScreenCTM().inverse());
+        const inPlot = local.x >= c.padL && local.x <= c.w - c.padR
+            && local.y >= c.padT && local.y <= c.h - c.padB;
+        if (!inPlot) {
+            hide();
+            return;
+        }
+
+        const outdoorT = curveTempFromX(local.x);
+        const flowT = clamp(policyFlowAt(curveState.draft, outdoorT), c.yMin, c.yMax);
+        const dotY = curveY(flowT);
+        // Near the right margin the chip would run off the plot, so it flips.
+        const flip = local.x + 90 > c.w - c.padR;
+
+        guide.setAttribute('x1', local.x);
+        guide.setAttribute('x2', local.x);
+        cross.setAttribute('d', `M ${local.x - 4} ${local.y} h 8 M ${local.x} ${local.y - 4} v 8`);
+        dot.setAttribute('cx', local.x);
+        dot.setAttribute('cy', dotY);
+        read.setAttribute('x', local.x + (flip ? -10 : 10));
+        read.setAttribute('y', dotY + 4);
+        read.setAttribute('text-anchor', flip ? 'end' : 'start');
+        outText.textContent = `${outdoorT.toFixed(0)}° →`;
+        flowText.textContent = `${flowT.toFixed(0)}°`;
+
+        probe.dataset.on = 'true';
+        curveState.probing = true;
+    });
+
+    svg.addEventListener('pointerleave', hide);
+}
+
+export function setCurveMode(useWc) {
+    curveState.draft.useWc = useWc;
+    repaintCurve();
+}
+
+export function resetCurve() {
+    curveState.draft = { ...curveState.saved };
+    repaintCurve();
+}
+
+export async function saveCurve() {
+    const { draft } = curveState;
+    if (draft.useWc && draft.min > draft.max) {
+        toast('The warm-weather flow temperature must sit below the cold-weather one.', 'error');
+        return;
+    }
+    try {
+        await client.updateFlowTemperatureConfiguration(draft.useWc, draft.fixed, draft.min, draft.max);
+        curveState.saved = { ...draft };
+        toast('Flow policy saved');
+        repaintCurve();
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+// --- Dashboard ------------------------------------------------------------
+
+function renderDashboard(config, livePerf) {
+    const hp = config.heatPump || {};
+    const controller = config.controller || {};
+    const perf = config.performance || {};
+    const device = config.device || {};
+
+    initCurveState(hp);
+
+    linkState.classList.remove('hidden');
+    const faults = hp.faultCodes?.length ? hp.faultCodes : null;
+    linkState.dataset.state = faults ? 'fault' : (controller.connected ? 'on' : 'off');
+    linkState.textContent = faults ? `Fault ${faults.join(', ')}` : (controller.connected ? 'Connected' : 'Offline');
+
+    const zones = activeZones(config);
+
+    let html = `
+    <section class="sheet schematic-sheet">
+        <div class="sheet-head">
+            <span class="plate">Right now</span>
+            <div class="head-actions">
+                <span class="plate" id="live-age">${esc(readAge(livePerf?.readAt))}</span>
+            </div>
+        </div>
+        <div id="schematic-wrap">${renderSchematicSvg(livePerf, hp)}</div>
+        <div class="branches">${renderBranches(config)}</div>
+    </section>`;
+
+    html += renderCurveSheet(livePerf);
+
+    html += `<div class="columns">${zones.map(zone => renderZoneSheet(zone)).join('')}</div>`;
+
+    html += `
+    <section class="sheet">
+        <div class="sheet-head">
+            <span class="plate">Performance</span>
+            <div class="head-actions">
+                <button class="btn btn--quiet btn--sm" onclick="app.showPerformanceHistory()">Last 14 days</button>
+            </div>
+        </div>
+        <dl class="spec">
+            <dt>Seasonal efficiency</dt><dd>${num(perf.seasonalCoefficientOfPerformance, 2) ?? '––'}</dd>
+            <dt>Heat delivered</dt><dd>${num(perf.heatOutput?.value) ?? '––'} kWh</dd>
+            <dt>Electricity used</dt><dd>${num(perf.energyInput?.value) ?? '––'} kWh</dd>
+            <dt>Counted since</dt><dd>${hp.latestCounterReset ? esc(new Date(hp.latestCounterReset).toLocaleDateString()) : '––'}</dd>
+        </dl>
+    </section>
+
+    <details class="sheet">
+        <summary class="plate" style="cursor:pointer;list-style:none;">Controller detail</summary>
+        <div style="margin-top:1.5rem;display:grid;gap:1.5rem;">
+            <div class="actions">
+                <button class="btn btn--quiet btn--sm" onclick="app.toggleQuieterMode(${!hp.quieterModeEnabled})">
+                    ${hp.quieterModeEnabled ? 'Turn quieter mode off' : 'Turn quieter mode on'}
+                </button>
+                ${device.controlMode === 'SMART' ? '' : '<button class="btn btn--quiet btn--sm" onclick="app.setupSmartControl()">Let Octopus optimise</button>'}
+            </div>
+            <dl class="spec">
+                <dt>Model</dt><dd>${esc(hp.model || '––')}</dd>
+                <dt>Serial</dt><dd>${esc(hp.serialNumber || '––')}</dd>
+                <dt>Quieter mode</dt><dd>${hp.quieterModeEnabled ? 'On' : 'Off'}</dd>
+                <dt>Optimisation</dt><dd>${device.controlMode === 'SMART' ? 'Octopus is optimising' : 'You are in control'}</dd>
+                <dt>Hot water range</dt><dd>${hp.minWaterSetpoint ?? '––'}–${hp.maxWaterSetpoint ?? '––'}°C</dd>
+                <dt>Faults</dt><dd>${faults ? esc(faults.join(', ')) : 'None'}</dd>
+                <dt>Controller state</dt><dd>${esc(controller.state?.join(', ') || '––')}</dd>
+                <dt>Hardware</dt><dd>${esc(hp.hardwareVersion || '––')}</dd>
+                <dt>Firmware</dt><dd>ESP32 ${esc(controller.firmwareConfiguration?.esp32 || '––')} · EFR32 ${esc(controller.firmwareConfiguration?.efr32 || '––')}</dd>
+                <dt>EUI</dt><dd>${esc(controller.firmwareConfiguration?.eui || '––')}</dd>
+                <dt>Last restart</dt><dd>${controller.lastReset ? esc(new Date(controller.lastReset).toLocaleString()) : '––'}</dd>
+            </dl>
+        </div>
+    </details>`;
+
+    viewDashboard.innerHTML = html;
+    bindCurve();
+}
+
+function renderZoneSheet(zone) {
+    const { measured, target } = zoneReading(zone);
+    const state = zoneState(zone);
+    const mode = zone.currentOperation?.mode;
+
+    const sensors = (zone.sensors || []).filter(s => !(s.telemetry && isSentinel(s.telemetry.temperatureInCelsius)));
+
+    const sensorsHtml = sensors.length ? `
+        <div>
+            <div class="subhead">Sensors</div>
+            ${sensors.map(s => {
+                const primary = zone.primarySensor === s.code;
+                const offline = s.connectivity && !s.connectivity.online;
+                const parts = [];
+                if (s.telemetry) {
+                    if (!isSentinel(s.telemetry.temperatureInCelsius)) parts.push(`${num(s.telemetry.temperatureInCelsius)}°`);
+                    if (s.telemetry.humidityPercentage) parts.push(`${s.telemetry.humidityPercentage}% RH`);
+                    if (s.telemetry.voltage) parts.push(`${s.telemetry.voltage}V`);
+                    if (s.telemetry.rssi != null) parts.push(`${s.telemetry.rssi} dBm`);
+                }
+                return `
+                <div class="sensor" data-offline="${offline}">
+                    <div class="sensor-name">
+                        ${primary ? '<span class="sensor-primary" title="Sets this zone\'s temperature">◆</span>' : ''}
+                        <span>${esc(s.displayName || s.code)}</span>
+                        ${offline ? '<span class="tag tag--warn">Offline</span>' : ''}
+                    </div>
+                    <div class="sensor-read">${parts.join(' · ') || '––'}</div>
+                    <div class="sensor-tools">
+                        <button class="btn btn--quiet btn--sm" onclick="app.renameSensor('${esc(s.code)}')">Rename</button>
+                        ${primary ? '' : `<button class="btn btn--quiet btn--sm" onclick="app.setPrimarySensor('${esc(zone.code)}','${esc(s.code)}')">Use for this zone</button>`}
+                    </div>
+                </div>`;
+            }).join('')}
+        </div>` : '';
+
+    const schedulesHtml = zone.schedules?.length ? `
+        <table class="sched">
+            <thead><tr><th>Days</th><th>Slots</th></tr></thead>
+            <tbody>
+                ${zone.schedules.map(s => `
+                <tr>
+                    <td>${renderDayMask(s.days)}</td>
+                    <td>${s.settings.map(slot => `
+                        <div class="slot">
+                            <span class="slot-time">${esc(slot.time)}</span>
+                            ${slot.action === 'OFF'
+                                ? '<span class="slot-off">off</span>'
+                                : `<span class="slot-set">${slot.setpointInCelsius != null ? `${Number(slot.setpointInCelsius).toFixed(1)}°` : esc(slot.action)}</span>`}
+                        </div>`).join('')}
+                    </td>
+                </tr>`).join('')}
+            </tbody>
+        </table>` : '<p class="empty">No schedule set.</p>';
+
+    return `
+    <section class="sheet zone stack" data-state="${state}" style="--circuit:${circuitVar(zone.zoneType)}">
+        <div>
+            <div class="zone-head">
+                <span class="zone-name">${esc(zone.displayName || zone.code)}</span>
+                <span class="tag tag--circuit">${circuitLabel(zone.zoneType)}</span>
+            </div>
+            <div class="reading">
+                <span class="reading-now">${measured != null ? `${measured.toFixed(1)}°` : (target != null ? `${Number(target).toFixed(1)}°` : '––')}</span>
+                <span class="reading-target">${
+                    measured != null
+                        ? (target != null ? `target ${Number(target).toFixed(1)}°` : '')
+                        : (target != null ? 'target · no sensor here' : '')
+                }</span>
+            </div>
+            <div class="tags" style="margin-top:.75rem;">
+                ${mode ? `<span class="tag">${esc(mode)}</span>` : ''}
+                ${state === 'calling' ? '<span class="tag tag--solid tag--circuit">Calling for heat</span>' : ''}
+                ${zone.telemetry?.relaySwitchedOn ? '<span class="tag tag--circuit">Relay on</span>' : ''}
+                ${zone.emergency ? '<span class="tag tag--warn">Emergency</span>' : ''}
+            </div>
+        </div>
+        ${sensorsHtml}
+        <div>
+            <div class="subhead">Schedule</div>
+            ${schedulesHtml}
+        </div>
+        <div class="actions">
+            <button class="btn btn--primary btn--sm" onclick="app.showZoneOverride('${esc(zone.code)}')">Override</button>
+            <button class="btn btn--quiet btn--sm" onclick="app.showEditZone('${esc(zone.code)}')">Edit schedule</button>
+            <button class="btn btn--quiet btn--sm" onclick="app.renameZone('${esc(zone.code)}')">Rename</button>
+        </div>
+    </section>`;
+}
+
+function renderDayMask(mask) {
+    return `<div class="daymask">${dayInitials.map((d, i) =>
+        `<span class="daymask-cell" data-on="${mask[i] === '1'}" title="${dayNames[i]}">${d}</span>`
+    ).join('')}</div>`;
+}
+
+// --- Live refresh ---------------------------------------------------------
 
 function startLiveRefresh() {
     stopLiveRefresh();
-    liveRefreshInterval = setInterval(updateLivePerformance, 5000);
+    liveRefreshInterval = setInterval(updateLive, 5000);
 }
 
 function stopLiveRefresh() {
@@ -210,464 +1045,155 @@ function stopLiveRefresh() {
     }
 }
 
-async function updateLivePerformance() {
-    if (!client || viewDashboard.classList.contains('hidden')) return; // Only if visible
+async function updateLive() {
+    if (!client || viewDashboard.classList.contains('hidden')) return;
 
     try {
-        const livePerf = await client.getLivePerformance();
-        const container = document.getElementById('live-performance-container');
-        if (container) {
-            container.innerHTML = renderLivePerformance(livePerf);
-        }
+        latestLive = await client.getLivePerformance();
     } catch (e) {
-        console.warn('Live perf refresh failed:', e.message);
-    }
-}
-
-function renderDashboard(config, livePerf) {
-    const hp = config.heatPump || {};
-    const c = config.controller || {};
-    const p = config.performance || {};
-    const d = config.device || {};
-
-    // controlMode reports whether Octopus is actively optimising the pump.
-    const controlModeHtml = d.controlMode === 'SMART'
-        ? '<span class="badge" style="background:#38a169;color:white;">Smart</span>'
-        : (d.controlMode === 'MANUAL' ? '<span class="badge">Manual</span>' : '<code>Unknown</code>');
-
-    const setupLink = `<a href="javascript:void(0)" onclick="app.setupSmartControl()" style="margin-left:.25rem;color:#4299e1;">[Setup]</a>`;
-    const smartControlHtml = d.controlMode === 'SMART'
-        ? '<code>Active</code>'
-        : setupLink;
-
-    // safe getters
-    const flowTemp = hp.heatingFlowTemperature?.currentTemperature?.value != null ? hp.heatingFlowTemperature.currentTemperature.value : '-';
-
-    const wComp = hp.weatherCompensation || {};
-    let wCompHtml = wComp.enabled ? '<span class="badge">Enabled</span>' : 'Disabled';
-    if (wComp.enabled && wComp.currentRange) {
-        wCompHtml += ` <span style="font-size:0.85rem;color:#718096;">(${wComp.currentRange.minimum?.value || '-'} - ${wComp.currentRange.maximum?.value || '-'}°C)</span>`;
+        console.warn('Live performance refresh failed:', e.message);
+        return;
     }
 
-    let flowTempHtml = `<strong>Fixed Flow Temp:</strong> ${flowTemp}°C`;
-    if (wComp.enabled) {
-        flowTempHtml += ` <span style="font-size:0.8rem;color:#718096;">(Inactive)</span>`;
-    } else {
-        flowTempHtml += ` <span style="font-size:0.8rem;color:#38a169;">(Active)</span>`;
-    }
-    flowTempHtml += ` <a href="javascript:void(0)" onclick="app.showFlowTempEditor()" style="margin-left:.25rem;color:#4299e1;">[Configure Flow]</a>`;
+    const wrap = document.getElementById('schematic-wrap');
+    if (wrap) wrap.innerHTML = renderSchematicSvg(latestLive, currentConfig?.heatPump);
+    const age = document.getElementById('live-age');
+    if (age) age.textContent = readAge(latestLive?.readAt);
 
-    const fmtUnit = (u) => u === 'KILOWATT_HOUR' ? 'kWh' : (u || '');
-
-    let html = `<div id="live-performance-container">${renderLivePerformance(livePerf)}</div>`;
-
-    html += `
-        <h2 style="margin-bottom:1.5rem;font-size:1.3rem;">
-          System Overview
-          <div style="font-size:.85rem;font-weight:400;color:#718096;margin-top:.5rem;">
-            ${c.connected ? '<span class="connected">● Connected</span>' : '<span class="disconnected">● Disconnected</span>'}
-            &nbsp;·&nbsp; ${hp.model || 'Unknown Model'} (SN: ${hp.serialNumber || 'Unknown'})
-          </div>
-        </h2>`;
-
-    html += `
-        <div class="grid-2" style="margin-bottom: 2rem;">
-            <div class="card">
-                <div class="card-title">Controller & Hardware</div>
-                <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
-                    <strong>Control Mode:</strong> ${controlModeHtml}<br/>
-                    <strong>Device ID:</strong> <code>${d.deviceId || 'Unknown'}</code><br/>
-                    <strong>Property ID:</strong> <code>${d.currentLocation?.propertyId || 'Unknown'}</code><br/>
-                    <strong>Provisioned:</strong> <code>${d.provisionedAt ? new Date(d.provisionedAt).toLocaleDateString() : 'Unknown'}</code><br/>
-                    <strong>Onboarded:</strong> <code>${d.onboarding?.onboardedAt ? new Date(d.onboarding.onboardedAt).toLocaleDateString() : 'Unknown'}</code><br/>
-                    <strong>State:</strong> <code>${c.state?.join(', ') || 'Unknown'}</code><br/>
-                    <strong>Smart Control:</strong> ${smartControlHtml}<br/>
-                    <strong>HW Version:</strong> <code>${hp.hardwareVersion || 'Unknown'}</code><br/>
-                    <strong>FW (ESP32):</strong> <code>${c.firmwareConfiguration?.esp32 || 'Unknown'}</code><br/>
-                    <strong>FW (EFR32):</strong> <code>${c.firmwareConfiguration?.efr32 || 'Unknown'}</code><br/>
-                    <strong>EUI:</strong> <code>${c.firmwareConfiguration?.eui || 'Unknown'}</code><br/>
-                    <strong>Password:</strong> <code>${c.accessPointPassword || '***'}</code><br/>
-                    <strong>Faults:</strong> <code>${hp.faultCodes?.length ? hp.faultCodes.join(', ') : 'None'}</code><br/>
-                    <strong>Quieter Mode:</strong> <code>${hp.quieterModeEnabled ? 'Yes' : 'No'}</code> <a href="javascript:void(0)" onclick="app.toggleQuieterMode(${!hp.quieterModeEnabled})" style="margin-left:.25rem;color:#4299e1;">[Toggle]</a><br/>
-                    <strong>Last Reset:</strong> <code>${c.lastReset ? new Date(c.lastReset).toLocaleString() : 'Unknown'}</code>
-                </div>
-            </div>
-            
-            <div class="card">
-                <div class="card-title" style="display:flex; align-items:center;">
-                    Heating & Performance
-                    <a href="javascript:void(0)" onclick="app.showPerformanceHistory()" style="margin-left:auto;font-size:0.85rem;color:#4299e1;font-weight:400;">[Daily History]</a>
-                </div>
-                <div style="font-size: .95rem; line-height: 1.8; color: #4a5568;">
-                    ${flowTempHtml}<br/>
-                    <strong>Hot Water Limits:</strong> ${hp.minWaterSetpoint || '-'}°C - ${hp.maxWaterSetpoint || '-'}°C<br/>
-                    <strong>Weather Comp:</strong> ${wCompHtml}<br/>
-                    <hr style="margin: .5rem 0; border: 0; border-top: 1px solid #e2e8f0;">
-                    <strong>SCOP:</strong> ${p?.seasonalCoefficientOfPerformance ? parseFloat(p.seasonalCoefficientOfPerformance).toFixed(2) : 'N/A'}<br/>
-                    <strong>Heat Output:</strong> ${p?.heatOutput?.value ? parseFloat(p.heatOutput.value).toFixed(1) : 0} ${fmtUnit(p?.heatOutput?.unit)}<br/>
-                    <strong>Energy Input:</strong> ${p?.energyInput?.value ? parseFloat(p.energyInput.value).toFixed(1) : 0} ${fmtUnit(p?.energyInput?.unit)}<br/>
-                    <strong>Read At:</strong> ${p?.readAt ? new Date(p.readAt).toLocaleString() : 'Unknown'}
-                </div>
-            </div>
-        </div>
-
-        <h2 style="margin-bottom:1.5rem;font-size:1.3rem;">Heat Pump Zones</h2>
-        <div class="grid-2">
-    `;
-
-    config.zones.forEach(container => {
-        const zone = container.configuration;
-        // Hide disabled zones
-        if (!zone.enabled) return;
-
-        const typeBadge = getZoneTypeBadge(zone.zoneType);
-        const heatDemandBadge = zone.heatDemand ? '<span class="badge" style="background:#e53e3e;color:white;">🔥 Heat Demand</span>' : '';
-        const callForHeatBadge = zone.callForHeat ? '<span class="badge" style="background:#dd6b20;color:white;">Call for Heat</span>' : '';
-        const emergencyBadge = zone.emergency ? '<span class="badge" style="background:#e53e3e;color:white;">Emergency</span>' : '';
-
-        const isSentinel = (t) => t == null || parseFloat(t) < -20;
-        const sensors = (zone.sensors || []).filter(s =>
-            !(s.telemetry && isSentinel(s.telemetry.temperatureInCelsius))
-        );
-        let sensorsHtml = '';
-        if (sensors.length > 0) {
-            sensorsHtml = `
-                <div style="margin-top: 1.25rem;">
-                    <div style="font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#a0aec0;margin-bottom:.5rem;">Sensors</div>
-                    ${sensors.map(s => {
-                const isPrimary = (zone.primarySensor === s.code);
-                const isOffline = s.connectivity && !s.connectivity.online;
-                const badTemp = s.telemetry && isSentinel(s.telemetry.temperatureInCelsius);
-                const dimmed = isOffline || badTemp;
-                const opacity = dimmed ? 'opacity:.45;' : '';
-
-                let metaChips = [];
-                if (s.firmwareVersion && s.firmwareVersion !== '0D') metaChips.push(`<span class="chip" style="background:#f7fafc;color:#718096;">FW ${s.firmwareVersion}</span>`);
-
-                let telemetryLine = '';
-                if (s.telemetry) {
-                    let parts = [];
-                    if (!isSentinel(s.telemetry.temperatureInCelsius)) parts.push(`${parseFloat(s.telemetry.temperatureInCelsius).toFixed(1)}°C`);
-                    if (s.telemetry.humidityPercentage) parts.push(`${s.telemetry.humidityPercentage}% RH`);
-                    if (s.telemetry.rssi != null) parts.push(`📶 ${s.telemetry.rssi} dBm`);
-                    if (s.telemetry.voltage) parts.push(`${s.telemetry.voltage}V`);
-                    if (parts.length) telemetryLine = `<span style="color:#718096;">${parts.join(' · ')}</span>`;
-                }
-                const connChip = s.connectivity
-                    ? (s.connectivity.online
-                        ? `<span class="chip" style="background:#f0fff4;color:#276749;">● Online</span>`
-                        : `<span class="chip" style="background:#fff5f5;color:#c53030;">● Offline</span>`)
-                    : '';
-
-                const primaryStar = isPrimary ? `<span title="Primary sensor" style="color:#e05c35;margin-right:.2rem;">★</span>` : `<span style="color:transparent;margin-right:.2rem;">★</span>`;
-
-                const renameBtn = `<button class="chip-btn" onclick="app.renameSensor('${s.code}', '${s.displayName || ''}')">Rename</button>`;
-                const setPrimaryBtn = !isPrimary ? `<button class="chip-btn" onclick="app.setPrimarySensor('${zone.code}', '${s.code}')">Set Primary</button>` : '';
-
-                return `<div class="sensor-row" style="${opacity}">
-                            <div style="display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;">
-                                ${primaryStar}<span style="font-size:.85rem;font-weight:500;color:#2d3748;">${s.displayName || s.code}</span>
-                                <span style="font-size:.75rem;color:#a0aec0;">${s.type}</span>
-                                ${metaChips.join('')}
-                                ${connChip}
-                            </div>
-                            ${telemetryLine ? `<div style="font-size:.8rem;color:#718096;padding-left:1.4rem;margin-top:.15rem;">${telemetryLine}</div>` : ''}
-                            <div style="padding-left:1.4rem;margin-top:.25rem;display:flex;gap:.35rem;flex-wrap:wrap;">${renameBtn}${setPrimaryBtn}</div>
-                        </div>`;
-            }).join('')}
-                </div>
-            `;
-        }
-
-        let schedulesHtml = '';
-        if (zone.schedules && zone.schedules.length > 0) {
-            schedulesHtml = `
-                <table>
-                  <thead><tr><th>Days</th><th>Slots</th></tr></thead>
-                  <tbody>
-                    ${zone.schedules.map(s => `
-                        <tr>
-                            <td style="white-space:nowrap;">${fmtDays(s.days)}</td>
-                            <td>
-                                ${s.settings.map(slot => `
-                                    <div style="margin:.1rem 0;">
-                                        <code style="font-size:.8rem;">${slot.time}</code>
-                                        ${fmtAction(slot.action, slot.setpointInCelsius)}
-                                    </div>
-                                `).join('')}
-                            </td>
-                        </tr>
-                    `).join('')}
-                  </tbody>
-                </table>
-            `;
-        } else {
-            schedulesHtml = '<span class="no-schedules">No schedules configured.</span>';
-        }
-
-        let prevOpHtml = '';
-        if (zone.previousOperation) {
-            const prevAction = zone.previousOperation.action || '-';
-            prevOpHtml = `<br/>Previous: <strong>${zone.previousOperation.mode || 'None'}</strong> &nbsp;·&nbsp; Action: <strong>${prevAction}</strong>`;
-        }
-
-        html += `
-            <div class="card">
-                <div class="card-title" style="flex-wrap: wrap; gap: .5rem;">
-                    ${zone.displayName}
-                    <button class="btn btn-secondary btn-sm" style="padding:.1rem .5rem;" onclick="app.renameZone('${zone.code}', '${zone.displayName || ''}')">Rename</button>
-                    ${typeBadge}
-                    ${heatDemandBadge}
-                    ${callForHeatBadge}
-                    ${emergencyBadge}
-                    <button class="btn btn-sm btn-secondary" style="margin-left:auto;padding:.1rem .5rem;" onclick="app.showZoneOverride('${zone.code}')">Override</button>
-                </div>
-                <div class="zone-meta">
-                    Mode: <strong>${zone.currentOperation?.mode || 'None'}</strong> <a href="javascript:void(0)" onclick="app.changeZoneMode('${zone.code}', '${zone.currentOperation?.mode || 'AUTO'}')" style="margin-left:.25rem;color:#4299e1;">[Change]</a>
-                    ${zone.currentOperation?.setpointInCelsius ? `&nbsp;·&nbsp; Setpoint: <strong>${zone.currentOperation.setpointInCelsius.toFixed(1)}°C</strong>` : ''}
-                    ${zone.currentOperation?.action ? `&nbsp;·&nbsp; Action: <strong>${zone.currentOperation.action}</strong>` : ''}
-                    ${prevOpHtml}
-                    ${zone.telemetry ? `<hr style="margin:.75rem 0 .5rem 0;border:0;border-top:1px dashed #cbd5e0;"/>
-                    <div style="display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;margin-top:.25rem;">
-                        ${zone.telemetry.mode ? `<span class="chip">${zone.telemetry.mode}</span>` : ''}
-                        ${(zone.telemetry.setpointInCelsius != null && zone.telemetry.setpointInCelsius > -200) ? `<span class="chip" style="background:#ebf8ff;color:#2c5282;">🌡 ${parseFloat(zone.telemetry.setpointInCelsius).toFixed(1)}°C</span>` : ''}
-                        ${zone.telemetry.heatDemand ? `<span class="chip" style="background:#fff5f0;color:#c05621;">🔥 Heat Demand</span>` : `<span class="chip" style="background:#f7fafc;color:#a0aec0;">No Heat Demand</span>`}
-                        ${zone.telemetry.relaySwitchedOn ? `<span class="chip" style="background:#fff5f5;color:#c53030;">⚡ Relay ON</span>` : `<span class="chip" style="background:#f7fafc;color:#a0aec0;">Relay OFF</span>`}
-                    </div>` : ''}
-                </div>
-                ${sensorsHtml}
-                <div style="margin-top:1rem;">
-                    ${schedulesHtml}
-                </div>
-                <div style="margin-top:1rem;">
-                    <button class="btn btn-primary btn-sm" onclick="app.showEditZone('${zone.code}')">Edit Schedule</button>
-                </div>
-            </div>
-        `;
-    });
-
-    html += '</div>';
-    viewDashboard.innerHTML = html;
+    // Leave the curve alone while it is being edited or read.
+    if (curveState && !curveState.dragging && !curveState.probing && !curveIsDirty()) repaintCurve();
 }
 
-function getZoneTypeBadge(type) {
-    if (type === 'HEAT') return '<span class="badge">Heating</span>';
-    if (type === 'WATER') return '<span class="badge water">Hot Water</span>';
-    if (type === 'AUXILIARY') return '<span class="badge aux">Auxiliary</span>';
-    if (type === 'WIRED_THERMOSTAT') return '<span class="badge aux">Wired Thermostat</span>';
-    if (type === 'DIVERTER_VALVE') return '<span class="badge aux">Diverter Valve</span>';
-    return '';
-}
-
-function fmtAction(action, setpoint) {
-    if (action === "OFF") return `<span style="color:#742a2a">▼ Off</span>`;
-    return `<span style="color:#2b6cb0">🌡 ${setpoint ? Number(setpoint).toFixed(1) : action}°C</span>`;
-}
-
-// --- Edit Zone Rendering ---
+// --- Schedule editor ------------------------------------------------------
 
 export function showEditZone(zoneCode) {
-    const zoneContainer = currentConfig.zones.find(z => z.configuration.code === zoneCode);
-    if (!zoneContainer) return;
-    const zone = zoneContainer.configuration;
+    const zone = currentConfig.zones.find(z => z.configuration.code === zoneCode)?.configuration;
+    if (!zone) return;
 
     hideAllViews();
     logoutBtn.classList.remove('hidden');
     viewEditZone.classList.remove('hidden');
 
-    renderEditZoneForm(zone);
-}
-
-function renderEditZoneForm(zone) {
-    // We'll attach the zone object to the DOM or keep a reference to render the form
-    // For simplicity, I'll generate the full HTML string again.
-
-    let html = `
-        <div style="margin-bottom:1rem;">
-          <a href="#" onclick="app.showDashboard(); return false;" class="btn btn-secondary btn-sm">← Back</a>
-        </div>
-        <div id="edit-msg" class="alert hidden"></div>
-        <div class="card">
-            <div class="card-title">
-                ${zone.displayName}
-                ${getZoneTypeBadge(zone.zoneType)}
+    viewEditZone.innerHTML = `
+        <button class="btn btn--quiet btn--sm backlink" onclick="app.showDashboard()">← Dashboard</button>
+        <section class="sheet zone" style="--circuit:${circuitVar(zone.zoneType)}">
+            <div class="sheet-head">
+                <span class="plate">Schedule · ${esc(zone.displayName || zone.code)}</span>
             </div>
-            <p style="font-size:.85rem;color:#718096;margin-bottom:1.25rem;">
-                Edit the weekly schedule for this zone.
+            <p class="prose" style="margin-bottom:1.5rem;">
+                Each group applies to the days you tick. A slot runs from its start time until the next one.
             </p>
-            <form id="scheduleForm" onsubmit="app.handleSaveSchedule(event, '${zone.code}', '${zone.zoneType}')">
-                <div id="groups">
-    `;
-
-    (zone.schedules || []).forEach((sched, gi) => {
-        html += renderGroup(gi, sched);
-    });
-
-    html += `
-                </div>
+            <form id="scheduleForm" onsubmit="app.handleSaveSchedule(event, '${esc(zone.code)}', '${esc(zone.zoneType)}')">
+                <div id="groups">${(zone.schedules || []).map(s => renderGroup(s)).join('')}</div>
                 <div style="margin-bottom:1.5rem;">
-                    <button type="button" class="btn btn-secondary" onclick="app.addGroup()">+ Add Day Group</button>
+                    <button type="button" class="btn btn--quiet btn--sm" onclick="app.addGroup()">Add day group</button>
                 </div>
                 <div class="actions">
-                    <button type="submit" class="btn btn-primary">Save Schedule</button>
-                    <a href="#" onclick="app.showDashboard(); return false;" class="btn btn-secondary">Cancel</a>
+                    <button type="submit" class="btn btn--primary">Save schedule</button>
+                    <button type="button" class="btn btn--quiet" onclick="app.showDashboard()">Cancel</button>
                 </div>
             </form>
-        </div>
-    `;
-
-    viewEditZone.innerHTML = html;
+        </section>`;
 }
 
-// --- Helpers for Bitmasks ---
-
-const dayNames = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
-const dayShort = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-function fmtDays(mask) {
-    const active = [];
-    for (let i = 0; i < 7; i++) {
-        if (mask[i] === '1') active.push(dayShort[i]);
-    }
-    return active.length > 0 ? active.join(', ') : mask;
-}
-
-// --- Exporting for UI interaction ---
-// The following functions need to be available globally or via the app object for the inline onclick handlers
-
-export function handleSaveSchedule(e, zoneCode, zoneType) {
-    e.preventDefault();
-    const form = e.target;
-    const msg = document.getElementById('edit-msg');
-
-    // Parse form data manually
-    // We can't use FormData easily because of the dynamic structure, so we'll walk the DOM
-    const groups = [];
-    document.querySelectorAll('#groups .group-block').forEach(gBlock => {
-        // Days
-        const checkedDays = [];
-        gBlock.querySelectorAll('.days-check input:checked').forEach(cb => {
-            checkedDays.push(cb.value);
-        });
-
-        let mask = "";
-        for (const d of dayNames) {
-            mask += checkedDays.includes(d) ? "1" : "0";
-        }
-
-        if (mask === "0000000") return; // Skip empty day groups
-
-        // Slots
-        const settings = [];
-        gBlock.querySelectorAll('.slots-body tr').forEach(row => {
-            const time = row.querySelector('input[type=text]').value;
-            const action = row.querySelector('select').value;
-            const setpoint = row.querySelector('input[type=number]').value;
-
-            if (!time) return;
-
-            const slot = { time, action };
-            if (action === "HEAT" && setpoint) {
-                slot.action = "SET_TEMPERATURE";
-                slot.setpointInCelsius = parseFloat(setpoint);
-            } else if (action === "HEAT" && !setpoint) {
-                // Skip invalid heat slot
-                return;
-            } else {
-                slot.action = "TURN_OFF";
-                slot.setpointInCelsius = null;
-            }
-            settings.push(slot);
-        });
-
-        if (settings.length > 0) {
-            groups.push({ days: mask, settings });
-        }
-    });
-
-    msg.className = 'alert alert-success';
-    msg.textContent = 'Saving...';
-    msg.classList.remove('hidden');
-
-    client.setZoneSchedules(zoneCode, zoneType, groups).then(() => {
-        msg.textContent = 'Schedule saved successfully!';
-    }).catch(err => {
-        msg.className = 'alert alert-error';
-        msg.textContent = err.message;
-    });
-}
-
-function renderGroup(gi, sched) {
-    const mask = sched ? sched.days : "0000000";
+function renderGroup(sched) {
+    const mask = sched ? sched.days : '0000000';
     const settings = sched ? sched.settings : [];
 
-    let html = `
-    <div class="group-block" style="border:1px solid #e2e8f0;border-radius:8px;padding:1rem;margin-bottom:1rem;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.75rem;">
-            <strong>Day Group</strong>
-            <button type="button" class="btn btn-danger btn-sm" onclick="app.removeGroup(this)">Remove Group</button>
+    return `
+    <div class="group">
+        <div class="group-head">
+            <span class="plate">Day group</span>
+            <button type="button" class="btn btn--danger btn--sm" onclick="app.removeGroup(this)">Remove</button>
         </div>
-        <div style="margin-bottom:.75rem;">
-            <label style="font-size:.85rem;font-weight:600;display:block;margin-bottom:.4rem;">Days</label>
-            <div class="days-check">
-    `;
-
-    dayNames.forEach((d, i) => {
-        const checked = mask[i] === '1' ? 'checked' : '';
-        html += `<label><input type="checkbox" value="${d}" ${checked}> ${d}</label>`;
-    });
-
-    html += `
-            </div>
+        <div class="dayrow" style="margin-bottom:1rem;">
+            ${dayNames.map((d, i) => `
+            <label class="daypick">
+                <input type="checkbox" value="${d}" ${mask[i] === '1' ? 'checked' : ''}>
+                <span>${d.slice(0, 2)}</span>
+            </label>`).join('')}
         </div>
-        <div>
-            <label style="font-size:.85rem;font-weight:600;display:block;margin-bottom:.4rem;">Time Slots</label>
-            <table style="width:100%;margin-bottom:.5rem;">
-                <thead><tr><th style="width:110px;">Time</th><th style="width:160px;">Action</th><th style="width:100px;">Temp (°C)</th><th style="width:60px;"></th></tr></thead>
-                <tbody class="slots-body">
-    `;
-
-    settings.forEach(slot => {
-        html += renderSlotRow(slot);
-    });
-
-    html += `
-                </tbody>
-            </table>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="app.addSlot(this)">+ Add Slot</button>
-        </div>
+        <table class="sched">
+            <thead>
+                <tr><th style="width:8rem;">From</th><th style="width:10rem;">Then</th><th style="width:7rem;">Target</th><th></th></tr>
+            </thead>
+            <tbody class="slots-body">${settings.map(slot => renderSlotRow(slot)).join('')}</tbody>
+        </table>
+        <button type="button" class="btn btn--quiet btn--sm" style="margin-top:.75rem;" onclick="app.addSlot(this)">Add slot</button>
     </div>`;
-    return html;
 }
 
 function renderSlotRow(slot) {
     const isHeat = slot && slot.action !== 'OFF';
-    const tempVal = (slot && slot.setpointInCelsius != null) ? slot.setpointInCelsius : '';
+    const tempVal = slot?.setpointInCelsius != null ? slot.setpointInCelsius : '';
     const timeVal = slot ? slot.time : '';
-    const styleHidden = isHeat ? '' : 'visibility:hidden';
 
     return `
-    <tr class="slot-row">
-        <td><input type="text" value="${timeVal}" placeholder="06:00" pattern="[0-2][0-9]:[0-5][0-9]" required></td>
+    <tr class="slot-edit">
+        <td><input type="time" value="${esc(timeVal)}" required></td>
         <td>
             <select onchange="app.toggleSetpoint(this)">
-                <option value="HEAT" ${isHeat ? 'selected' : ''}>Heat to temp</option>
-                <option value="OFF" ${!isHeat ? 'selected' : ''}>Off</option>
+                <option value="HEAT" ${isHeat ? 'selected' : ''}>Heat to</option>
+                <option value="OFF" ${isHeat ? '' : 'selected'}>Off</option>
             </select>
         </td>
-        <td><input class="setpoint-field" type="number" value="${tempVal}" min="5" max="80" step="0.5" placeholder="°C" style="${styleHidden}"></td>
-        <td><button type="button" class="btn btn-danger btn-sm" onclick="app.removeSlot(this)">✕</button></td>
+        <td class="setpoint-cell">
+            <input type="number" value="${esc(tempVal)}" min="5" max="80" step="0.5" placeholder="°C" ${isHeat ? '' : 'style="visibility:hidden"'}>
+        </td>
+        <td><button type="button" class="btn btn--quiet btn--sm" onclick="app.removeSlot(this)" aria-label="Remove slot">✕</button></td>
     </tr>`;
 }
 
-// UI helper functions attached to 'app' object
+export function handleSaveSchedule(e, zoneCode, zoneType) {
+    e.preventDefault();
+
+    const groups = [];
+    document.querySelectorAll('#groups .group').forEach(gBlock => {
+        const checkedDays = [...gBlock.querySelectorAll('.dayrow input:checked')].map(cb => cb.value);
+        const mask = dayNames.map(d => (checkedDays.includes(d) ? '1' : '0')).join('');
+        if (mask === '0000000') return;
+
+        const settings = [];
+        gBlock.querySelectorAll('.slots-body tr').forEach(row => {
+            const time = row.querySelector('input[type=time]').value;
+            const action = row.querySelector('select').value;
+            const setpoint = row.querySelector('input[type=number]').value;
+            if (!time) return;
+
+            if (action === 'HEAT') {
+                if (!setpoint) return; // A heat slot without a target is not a slot.
+                settings.push({ time, action: 'SET_TEMPERATURE', setpointInCelsius: parseFloat(setpoint) });
+            } else {
+                settings.push({ time, action: 'TURN_OFF', setpointInCelsius: null });
+            }
+        });
+
+        if (settings.length > 0) groups.push({ days: mask, settings });
+    });
+
+    const submitBtn = e.target.querySelector('button[type=submit]');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Saving…';
+
+    client.setZoneSchedules(zoneCode, zoneType, groups)
+        .then(() => {
+            toast('Schedule saved');
+            showDashboard();
+        })
+        .catch(err => {
+            toast(err.message, 'error');
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Save schedule';
+        });
+}
+
 export function removeGroup(btn) {
-    const groups = document.querySelectorAll('#groups .group-block');
+    const groups = document.querySelectorAll('#groups .group');
     if (groups.length <= 1) {
-        alert("You must have at least one schedule group. To clear completely, delete all the time slots.");
+        toast('Keep at least one day group. Remove its slots to clear the schedule.', 'error');
         return;
     }
-    btn.closest('.group-block').remove();
+    btn.closest('.group').remove();
 }
 
 export function removeSlot(btn) {
@@ -675,353 +1201,223 @@ export function removeSlot(btn) {
 }
 
 export function addGroup() {
-    document.getElementById('groups').insertAdjacentHTML('beforeend', renderGroup(0, null));
+    document.getElementById('groups').insertAdjacentHTML('beforeend', renderGroup(null));
 }
 
 export function addSlot(btn) {
-    const tbody = btn.previousElementSibling.querySelector('.slots-body');
-    tbody.insertAdjacentHTML('beforeend', renderSlotRow(null));
+    btn.previousElementSibling.querySelector('.slots-body').insertAdjacentHTML('beforeend', renderSlotRow(null));
 }
 
-export function toggleSetpoint(sel) {
-    const row = sel.closest('tr');
-    const sp = row.querySelector('input[type=number]');
-    sp.style.visibility = sel.value === 'OFF' ? 'hidden' : 'visible';
-    if (sel.value === 'OFF') sp.value = '';
+export function toggleSetpoint(select) {
+    const setpoint = select.closest('tr').querySelector('input[type=number]');
+    setpoint.style.visibility = select.value === 'OFF' ? 'hidden' : 'visible';
+    if (select.value === 'OFF') setpoint.value = '';
 }
 
-export async function toggleQuieterMode(enabled) {
-    if (!confirm(`Turn quieter mode ${enabled ? 'ON' : 'OFF'}?`)) return;
-    try {
-        await client.setQuieterMode(enabled);
-        await showDashboard(); // refresh
-    } catch (e) {
-        alert("Failed to toggle quieter mode: " + e.message);
-    }
-}
-
-export async function renameZone(zoneCode, currentName) {
-    const val = prompt(`Enter new name for zone ${zoneCode}:`, currentName || "");
-    if (val === null || val === currentName) return;
-    try {
-        await client.updateZoneDisplayName(zoneCode, val);
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to rename zone: " + e.message);
-    }
-}
-
-export async function setupSmartControl() {
-    if (!confirm("Are you sure you want to setup smart control for this heat pump?")) return;
-    try {
-        await client.setupSmartControl();
-        alert("Smart control setup initiated!");
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to setup smart control: " + e.message);
-    }
-}
-
-export async function renameSensor(sensorCode, currentName) {
-    const val = prompt(`Enter new name for sensor ${sensorCode}:`, currentName || "");
-    if (val === null || val === currentName) return;
-    try {
-        await client.updateSensorDisplayName(sensorCode, val);
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to rename sensor: " + e.message);
-    }
-}
-
-export async function setPrimarySensor(zoneCode, sensorCode) {
-    if (!confirm(`Make sensor ${sensorCode} the primary sensor for this zone?`)) return;
-    try {
-        await client.setZonePrimarySensor(zoneCode, sensorCode);
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to set primary sensor: " + e.message);
-    }
-}
-
-// --- Specialized View Forms ---
-
-export function showFlowTempEditor() {
-    const hp = currentConfig.heatPump;
-    const wComp = hp.weatherCompensation || {};
-    const flowTemp = hp.heatingFlowTemperature?.currentTemperature?.value || 50;
-
-    let html = `
-        <div class="card" style="max-width:600px;margin:0 auto;">
-            <div class="card-title">Flow Temperature Settings</div>
-            <form id="flow-temp-form" onsubmit="event.preventDefault(); app.submitFlowTempEditor(this)">
-                <div style="margin-bottom:1rem;">
-                    <label style="display:block;margin-bottom:.5rem;">
-                        <input type="checkbox" name="useWc" onchange="app.toggleWcFields(this.checked)" ${wComp.enabled ? 'checked' : ''}> Use Weather Compensation
-                    </label>
-                </div>
-                
-                <div id="ft-fixed" style="${wComp.enabled ? 'display:none;' : ''}">
-                    <label style="display:block;margin-bottom:.5rem;">Fixed Flow Temperature (°C)</label>
-                    <input type="number" name="flowTemp" value="${flowTemp}" step="1">
-                </div>
-                
-                <div id="ft-wc" style="${wComp.enabled ? '' : 'display:none;'}">
-                    <label style="display:block;margin-bottom:.25rem;">Weather Comp Min Temp (°C) <span style="font-size:0.75rem;color:#718096;">(Allowed: ${wComp.allowableMinimumTemperatureRange?.minimum?.value || '-'}-${wComp.allowableMinimumTemperatureRange?.maximum?.value || '-'})</span></label>
-                    <input type="number" name="wcMin" value="${wComp.currentRange?.minimum?.value || 25}" min="${wComp.allowableMinimumTemperatureRange?.minimum?.value || ''}" max="${wComp.allowableMinimumTemperatureRange?.maximum?.value || ''}" step="1">
-                    
-                    <label style="display:block;margin-top:1rem;margin-bottom:.25rem;">Weather Comp Max Temp (°C) <span style="font-size:0.75rem;color:#718096;">(Allowed: ${wComp.allowableMaximumTemperatureRange?.minimum?.value || '-'}-${wComp.allowableMaximumTemperatureRange?.maximum?.value || '-'})</span></label>
-                    <input type="number" name="wcMax" value="${wComp.currentRange?.maximum?.value || 50}" min="${wComp.allowableMaximumTemperatureRange?.minimum?.value || ''}" max="${wComp.allowableMaximumTemperatureRange?.maximum?.value || ''}" step="1">
-                </div>
-                
-                <div style="margin-top:1.5rem;">
-                    <button type="submit" class="btn btn-primary">Save Settings</button>
-                    <button type="button" class="btn btn-secondary" onclick="app.showDashboard()">Cancel</button>
-                </div>
-            </form>
-        </div>
-    `;
-    viewFlowTemp.innerHTML = html;
-
-    document.getElementById('dashboard-view').classList.add('hidden');
-    document.getElementById('edit-zone-view').classList.add('hidden');
-    if (viewZoneOverride) viewZoneOverride.classList.add('hidden');
-    viewFlowTemp.classList.remove('hidden');
-}
-
-export function toggleWcFields(checked) {
-    document.getElementById('ft-fixed').style.display = checked ? 'none' : 'block';
-    document.getElementById('ft-wc').style.display = checked ? 'block' : 'none';
-}
-
-export async function submitFlowTempEditor(form) {
-    const useWc = form.useWc.checked;
-    const flowTemp = form.flowTemp.value;
-    const wcMin = form.wcMin.value;
-    const wcMax = form.wcMax.value;
-
-    try {
-        await client.updateFlowTemperatureConfiguration(useWc, flowTemp, wcMin, wcMax);
-        alert("Flow Temperature Configuration Updated!");
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to update: " + e.message);
-    }
-}
+// --- Overrides ------------------------------------------------------------
 
 export function showZoneOverride(zoneCode) {
-    const zoneContainer = currentConfig.zones.find(z => z.configuration.code === zoneCode);
-    if (!zoneContainer) return;
-    const z = zoneContainer.configuration;
+    const zone = currentConfig.zones.find(z => z.configuration.code === zoneCode)?.configuration;
+    if (!zone) return;
 
-    let html = `
-        <div class="card" style="max-width:600px;margin:0 auto;">
-            <div class="card-title">Quick Override - ${z.displayName}</div>
-            <form onsubmit="event.preventDefault(); app.submitZoneOverride(this, '${zoneCode}')">
-                <div style="margin-bottom:1rem;">
-                    <label style="display:block;margin-bottom:.5rem;">Mode</label>
-                    <select name="mode" style="width:100%" onchange="app.toggleOverrideAction(this.value)">
-                        <option value="">Maintain Current Mode</option>
-                        <option value="AUTO">AUTO (Follow Schedule)</option>
-                        <option value="ON">ON</option>
-                        <option value="OFF">OFF</option>
-                        <option value="BOOST">BOOST</option>
+    const { target } = zoneReading(zone);
+
+    hideAllViews();
+    logoutBtn.classList.remove('hidden');
+    viewZoneOverride.classList.remove('hidden');
+
+    viewZoneOverride.innerHTML = `
+        <button class="btn btn--quiet btn--sm backlink" onclick="app.showDashboard()">← Dashboard</button>
+        <section class="sheet sheet--narrow zone" style="--circuit:${circuitVar(zone.zoneType)}">
+            <div class="sheet-head"><span class="plate">Override · ${esc(zone.displayName || zone.code)}</span></div>
+            <p class="prose" style="margin-bottom:1.5rem;">
+                Overrides sit on top of the schedule. Leave the end time empty to hold it until you change it back.
+            </p>
+            <form onsubmit="event.preventDefault(); app.submitZoneOverride(this, '${esc(zone.code)}')">
+                <label class="field">
+                    <span class="plate">Mode</span>
+                    <select name="mode" onchange="app.toggleOverrideAction(this.value)">
+                        <option value="AUTO">Follow the schedule</option>
+                        <option value="ON" selected>Heat now</option>
+                        <option value="BOOST">Boost</option>
+                        <option value="OFF">Off</option>
                     </select>
-                </div>
-                <div id="ov-action-box" style="margin-bottom:1rem; display:none;">
-                    <label style="display:block;margin-bottom:.5rem;">Action</label>
-                    <select name="action" style="width:100%" onchange="app.toggleOverrideSetpoint(this.value)">
-                        <option value="SET_TEMPERATURE">Set Temperature</option>
-                        <option value="TURN_ON">Turn On (Ignore Setpoint)</option>
-                        <option value="TURN_OFF">Turn Off</option>
-                    </select>
-                </div>
-                <div id="ov-setpoint" style="margin-bottom:1rem; display:none;">
-                    <label style="display:block;margin-bottom:.5rem;">Target Setpoint (°C)</label>
-                    <input type="number" name="setpoint" value="21" step="0.5">
-                </div>
-                <div style="margin-bottom:1rem;">
-                    <label style="display:block;margin-bottom:.5rem;">End Time (Leave empty for permanent override)</label>
+                </label>
+                <label class="field" id="ov-setpoint">
+                    <span class="plate">Target</span>
+                    <input type="number" name="setpoint" value="${target != null ? Number(target).toFixed(1) : '21'}" min="5" max="80" step="0.5">
+                </label>
+                <label class="field">
+                    <span class="plate">Until</span>
                     <input type="datetime-local" name="endAt">
-                </div>
-                <div style="margin-top:1.5rem;">
-                    <button type="submit" class="btn btn-primary">Apply Override</button>
-                    <button type="button" class="btn btn-secondary" onclick="app.showDashboard()">Cancel</button>
+                    <span class="field-hint">Empty = no end time</span>
+                </label>
+                <div class="actions">
+                    <button type="submit" class="btn btn--primary">Apply override</button>
+                    <button type="button" class="btn btn--quiet" onclick="app.showDashboard()">Cancel</button>
                 </div>
             </form>
-        </div>
-    `;
-    viewZoneOverride.innerHTML = html;
-
-    document.getElementById('dashboard-view').classList.add('hidden');
-    document.getElementById('edit-zone-view').classList.add('hidden');
-    if (viewFlowTemp) viewFlowTemp.classList.add('hidden');
-    viewZoneOverride.classList.remove('hidden');
+        </section>`;
 }
 
 export function toggleOverrideAction(mode) {
-    const box = document.getElementById('ov-action-box');
-    const sp = document.getElementById('ov-setpoint');
-    if (mode === 'OFF' || mode === 'AUTO') {
-        box.style.display = 'none';
-        sp.style.display = 'none';
-    } else {
-        box.style.display = 'block';
-        toggleOverrideSetpoint(document.querySelector('#ov-action-box select').value);
-    }
-}
-
-export function toggleOverrideSetpoint(action) {
-    document.getElementById('ov-setpoint').style.display = action === 'SET_TEMPERATURE' ? 'block' : 'none';
-}
-
-export async function changeZoneMode(zoneCode, currentMode) {
-    const mode = prompt(`Enter new mode for zone ${zoneCode} (AUTO, ON, OFF, BOOST):`, currentMode || "AUTO");
-    if (!mode) return;
-    
-    const validModes = ['AUTO', 'ON', 'OFF', 'BOOST'];
-    const cleanMode = mode.toUpperCase().trim();
-    
-    if (!validModes.includes(cleanMode)) {
-        alert("Invalid mode. Must be one of: AUTO, ON, OFF, BOOST");
-        return;
-    }
-    
-    if (cleanMode === currentMode) return;
-    
-    try {
-        await client.setZoneMode(zoneCode, cleanMode, null, null, null);
-        alert("Zone mode updated!");
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to change zone mode: " + e.message);
-    }
+    document.getElementById('ov-setpoint').style.display = (mode === 'ON' || mode === 'BOOST') ? 'block' : 'none';
 }
 
 export async function submitZoneOverride(form, zoneCode) {
-    const mode = form.mode.value || null;
-
-    // In GraphQL, ON, OFF, AUTO, BOOST are enums passed directly.
+    const mode = form.mode.value;
     let action = null;
     let setpoint = '';
 
-    if (mode === 'ON' || mode === 'BOOST' || mode === null) {
-        action = form.action.value;
-        if (action === 'SET_TEMPERATURE') {
-            setpoint = form.setpoint.value;
-        }
+    if (mode === 'ON' || mode === 'BOOST') {
+        action = 'SET_TEMPERATURE';
+        setpoint = form.setpoint.value;
     } else if (mode === 'OFF') {
         action = 'TURN_OFF';
-    } else if (mode === 'AUTO') {
-        action = null;
     }
 
     let endAt = form.endAt.value;
-    if (endAt) {
-        endAt = new Date(endAt).toISOString().split('.')[0] + 'Z';
-    }
+    if (endAt) endAt = new Date(endAt).toISOString().split('.')[0] + 'Z';
 
-    try {
-        await client.setZoneMode(zoneCode, mode, endAt, setpoint, action);
-        alert("Override Applied!");
-        await showDashboard();
-    } catch (e) {
-        alert("Failed to apply override: " + e.message);
-    }
+    await run(
+        () => client.setZoneMode(zoneCode, mode, endAt, setpoint, action),
+        mode === 'AUTO' ? 'Back on schedule' : 'Override applied',
+    );
 }
 
+// --- Controller actions ---------------------------------------------------
+
+export async function toggleQuieterMode(enabled) {
+    const ok = await confirmAction({
+        title: enabled ? 'Turn quieter mode on' : 'Turn quieter mode off',
+        body: enabled
+            ? 'The pump runs slower and quieter. It may take longer to reach temperature.'
+            : 'The pump returns to full output.',
+        confirmLabel: enabled ? 'Turn on' : 'Turn off',
+    });
+    if (!ok) return;
+    await run(() => client.setQuieterMode(enabled), enabled ? 'Quieter mode on' : 'Quieter mode off');
+}
+
+export async function renameZone(zoneCode) {
+    const zone = currentConfig.zones.find(z => z.configuration.code === zoneCode)?.configuration;
+    if (!zone) return;
+    const name = await promptForText({
+        title: 'Rename zone',
+        label: 'Zone name',
+        value: zone.displayName || '',
+    });
+    if (!name || name === zone.displayName) return;
+    await run(() => client.updateZoneDisplayName(zoneCode, name), 'Zone renamed');
+}
+
+export async function renameSensor(sensorCode) {
+    let current = '';
+    currentConfig.zones.forEach(z => {
+        const match = (z.configuration.sensors || []).find(s => s.code === sensorCode);
+        if (match) current = match.displayName || '';
+    });
+    const name = await promptForText({
+        title: 'Rename sensor',
+        label: 'Sensor name',
+        value: current,
+    });
+    if (!name || name === current) return;
+    await run(() => client.updateSensorDisplayName(sensorCode, name), 'Sensor renamed');
+}
+
+export async function setPrimarySensor(zoneCode, sensorCode) {
+    const ok = await confirmAction({
+        title: 'Use this sensor',
+        body: 'This zone will follow this sensor when deciding whether to call for heat.',
+        confirmLabel: 'Use it',
+    });
+    if (!ok) return;
+    await run(() => client.setZonePrimarySensor(zoneCode, sensorCode), 'Sensor set for this zone');
+}
+
+export async function setupSmartControl() {
+    const ok = await confirmAction({
+        title: 'Let Octopus optimise',
+        body: 'Octopus takes over scheduling to run the pump when electricity is cheapest.',
+        confirmLabel: 'Hand over',
+    });
+    if (!ok) return;
+    await run(() => client.setupSmartControl(), 'Optimisation requested');
+}
+
+// --- History --------------------------------------------------------------
+
 export async function showPerformanceHistory() {
-    viewLoading.classList.remove('hidden');
     hideAllViews();
     viewLoading.classList.remove('hidden');
+    logoutBtn.classList.remove('hidden');
 
     try {
         const end = new Date();
         const start = new Date();
         start.setDate(start.getDate() - 14);
 
-        const allData = await client.getPerformanceHistory(start.toISOString(), end.toISOString());
-        const totalData = await client.getTimeRangedPerformance(start.toISOString(), end.toISOString());
+        const [days, totals] = await Promise.all([
+            client.getPerformanceHistory(start.toISOString(), end.toISOString(), 'DAY'),
+            client.getTimeRangedPerformance(start.toISOString(), end.toISOString()),
+        ]);
 
-        let totalHtml = '';
-        if (totalData) {
-            const outEVal = parseFloat(totalData.energyOutput?.value);
-            const inVal = parseFloat(totalData.energyInput?.value);
-            const cop = totalData.coefficientOfPerformance ? parseFloat(totalData.coefficientOfPerformance).toFixed(2) : '-';
-            const elIn = !isNaN(inVal) ? inVal.toFixed(1) + ' kWh' : '-';
-            const htOut = !isNaN(outEVal) ? outEVal.toFixed(1) + ' kWh' : '-';
-            totalHtml = `
-                <div style="margin-bottom: 2rem; background: #f7fafc; padding: 1rem; border-radius: 8px; border: 1px solid #e2e8f0;">
-                    <h3 style="margin-bottom: .5rem; font-size: 1rem; color: #2d3748;">14-Day Totals</h3>
-                    <div style="display:flex; gap: 2rem; font-size: .95rem; color: #4a5568;">
-                        <div><strong>Energy In:</strong> ${elIn}</div>
-                        <div><strong>Heat Out:</strong> ${htOut}</div>
-                        <div><strong>Overall COP:</strong> ${cop}</div>
-                    </div>
-                </div>
-            `;
-        }
-
-        let rows = '';
-        if (allData && allData.length > 0) {
-            // Sort so newest week is at the top
-            const sorted = [...allData].sort((a, b) => new Date(b.startAt) - new Date(a.startAt));
-
-            rows = sorted.map(d => {
-                const outVal = parseFloat(d.outdoorTemperature?.value);
-                const inVal = parseFloat(d.energyInput?.value);
-                const outEVal = parseFloat(d.energyOutput?.value);
-                const outT = !isNaN(outVal) ? outVal.toFixed(1) + '°C' : '-';
-                const elIn = !isNaN(inVal) ? inVal.toFixed(1) + ' kWh' : '-';
-                const htOut = !isNaN(outEVal) ? outEVal.toFixed(1) + ' kWh' : '-';
-                let cop = '-';
-                if (inVal > 0 && outEVal > 0) {
-                    cop = (outEVal / inVal).toFixed(2);
-                }
-                const dateStr = new Date(d.startAt).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
-
-                return `<tr>
-                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${dateStr}</td>
-                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${outT}</td>
-                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${elIn}</td>
-                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;">${htOut}</td>
-                    <td style="padding:.5rem; border-bottom:1px solid #edf2f7;"><strong>${cop}</strong></td>
-                </tr>`;
-            }).join('');
-        } else {
-            rows = `<tr><td colspan="5" style="text-align:center; padding:1rem;">No history available for the last 14 days.</td></tr>`;
-        }
+        const rows = [...(days || [])]
+            .map(d => {
+                const energyIn = parseFloat(d.energyInput?.value);
+                const energyOut = parseFloat(d.energyOutput?.value);
+                return {
+                    date: new Date(d.startAt),
+                    outdoor: parseFloat(d.outdoorTemperature?.value),
+                    energyIn,
+                    energyOut,
+                    cop: energyIn > 0 && energyOut > 0 ? energyOut / energyIn : null,
+                };
+            })
+            .sort((a, b) => b.date - a.date);
 
         viewPerformance.innerHTML = `
-            <div class="card" style="margin: 0 auto;">
-                <div class="card-title">Daily Performance History</div>
-                ${totalHtml}
-                <div style="overflow-x: auto;">
-                    <table style="width:100%; text-align:left; border-collapse: collapse;">
-                        <thead>
-                            <tr>
-                                <th style="border-bottom:2px solid #e2e8f0; padding:.5rem;">Date</th>
-                                <th style="border-bottom:2px solid #e2e8f0; padding:.5rem;">Avg Outdoor Temp</th>
-                                <th style="border-bottom:2px solid #e2e8f0; padding:.5rem;">Energy In</th>
-                                <th style="border-bottom:2px solid #e2e8f0; padding:.5rem;">Heat Out</th>
-                                <th style="border-bottom:2px solid #e2e8f0; padding:.5rem;">COP</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${rows}
-                        </tbody>
-                    </table>
+        <button class="btn btn--quiet btn--sm backlink" onclick="app.showDashboard()">← Dashboard</button>
+        <section class="sheet">
+            <div class="sheet-head"><span class="plate">Last 14 days</span></div>
+            <div class="totals">
+                <div class="total-item">
+                    <span class="plate">Efficiency</span>
+                    <span class="total-val">${num(totals?.coefficientOfPerformance, 2) ?? '––'}</span>
                 </div>
-                <div style="margin-top:2rem;">
-                    <button class="btn btn-primary" onclick="app.showDashboard()">Back to Dashboard</button>
+                <div class="total-item">
+                    <span class="plate">Electricity used</span>
+                    <span class="total-val">${num(totals?.energyInput?.value) ?? '––'}<span class="s-unit" style="font-size:13px"> kWh</span></span>
+                </div>
+                <div class="total-item">
+                    <span class="plate">Heat delivered</span>
+                    <span class="total-val">${num(totals?.energyOutput?.value) ?? '––'}<span class="s-unit" style="font-size:13px"> kWh</span></span>
                 </div>
             </div>
-        `;
+            ${rows.length ? `
+            <table class="history">
+                <thead>
+                    <tr><th>Day</th><th>Outdoor</th><th>In</th><th>Out</th><th>Efficiency</th></tr>
+                </thead>
+                <tbody>
+                    ${rows.map(r => `
+                    <tr>
+                        <td>${esc(r.date.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }))}</td>
+                        <td>${isNaN(r.outdoor) ? '––' : `${r.outdoor.toFixed(1)}°`}</td>
+                        <td>${isNaN(r.energyIn) ? '––' : r.energyIn.toFixed(1)}</td>
+                        <td>${isNaN(r.energyOut) ? '––' : r.energyOut.toFixed(1)}</td>
+                        <td>${r.cop ? r.cop.toFixed(2) : '––'}</td>
+                    </tr>`).join('')}
+                </tbody>
+            </table>` : '<p class="empty">No readings in the last 14 days.</p>'}
+        </section>`;
 
         viewLoading.classList.add('hidden');
         viewPerformance.classList.remove('hidden');
-        logoutBtn.classList.remove('hidden');
     } catch (e) {
-        alert("Failed to load history: " + e.message);
         viewLoading.classList.add('hidden');
+        toast(e.message, 'error');
+        showDashboard();
     }
 }

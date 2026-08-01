@@ -4,64 +4,77 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Octopus Cosy Manager</title>
+  <meta name="color-scheme" content="light">
+  <title>Cosy 6 — heat pump control</title>
+  <link rel="preload" href="fonts/archivo-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/ibm-plex-mono-500.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="css/style.css">
 </head>
 
 <body>
-  <header>
-    <div>
-      <a href="#" onclick="app.showDashboard(); return false;">
-        <h1>🔥 Octopus Cosy Manager</h1>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <a class="mark" href="#" onclick="app.showDashboard(); return false;">
+        <span class="mark-name">Cosy 6</span>
+        <span class="mark-sub">Heat pump control</span>
       </a>
-    </div>
-    <div style="margin-left:auto;">
-      <button id="logout-btn" class="btn btn-secondary btn-sm hidden" onclick="app.logout()">Logout</button>
+      <div class="masthead-meta">
+        <span id="link-state" class="lamp hidden" data-state="off">Offline</span>
+        <button id="logout-btn" class="btn btn--quiet btn--sm hidden" onclick="app.logout()">Disconnect</button>
+      </div>
     </div>
   </header>
+
   <main id="app">
-    <div id="loading-view" class="loading hidden">Loading...</div>
+    <div id="loading-view" class="loading hidden">Reading controller</div>
 
     <div id="setup-view" class="hidden">
-      <div class="card" style="max-width: 500px; margin: 0 auto;">
-        <div class="card-title">Setup</div>
-        <p style="margin-bottom: 1rem; color: #4a5568;">
-          Enter your Octopus Energy API credentials. Your API key is <strong>stored securely in your local browser
-            storage</strong>
-          and is never sent to any external server. This web application runs entirely in your browser.
+      <div class="sheet sheet--narrow">
+        <div class="sheet-head"><span class="plate">Connect</span></div>
+        <p class="prose" style="margin-bottom:1.5rem;">
+          Your API key stays in this browser and is sent only to Octopus Energy. Find it in the Octopus dashboard
+          under Personal details → API access.
         </p>
         <form id="setup-form">
-          <div style="margin-bottom: 1rem;">
-            <label style="display:block; margin-bottom: 0.5rem; font-weight: 600;">API Key</label>
-            <input type="text" id="api-key" required placeholder="sk_live_...">
-          </div>
-          <button type="submit" id="setup-btn" class="btn btn-primary" style="width: 100%;">Connect</button>
+          <label class="field">
+            <span class="plate">API key</span>
+            <input type="password" id="api-key" required placeholder="sk_live_…" autocomplete="off" spellcheck="false">
+          </label>
+          <button type="submit" id="setup-btn" class="btn btn--primary btn--block">Connect</button>
         </form>
         <div id="device-selection" class="hidden">
-          <label style="display:block; margin-bottom: 0.5rem; font-weight: 600;">Select your Heat Pump</label>
-          <select id="device-selector" style="width: 100%; margin-bottom: 1rem;"></select>
-          <button id="select-device-btn" class="btn btn-primary" style="width: 100%;">Continue</button>
+          <label class="field">
+            <span class="plate">Heat pump</span>
+            <select id="device-selector"></select>
+          </label>
+          <button id="select-device-btn" class="btn btn--primary btn--block">Continue</button>
         </div>
-        <div id="setup-error" class="alert alert-error hidden" style="margin-top: 1rem;"></div>
+        <div id="setup-error" class="notice hidden" data-tone="error" style="margin-top:1.5rem;margin-bottom:0;"></div>
       </div>
     </div>
 
-    <div id="dashboard-view" class="hidden">
-      <!-- Dashboard content will be injected here -->
-    </div>
-
-    <div id="edit-zone-view" class="hidden">
-      <!-- Edit Zone content will be injected here -->
-    </div>
-
-    <div id="flow-temp-view" class="hidden"></div>
+    <div id="dashboard-view" class="hidden"></div>
+    <div id="edit-zone-view" class="hidden"></div>
     <div id="zone-override-view" class="hidden"></div>
     <div id="performance-view" class="hidden"></div>
   </main>
 
+  <div id="toasts" aria-live="polite"></div>
+
+  <dialog id="dialog">
+    <form method="dialog" id="dialog-form">
+      <div class="dialog-title" id="dialog-title"></div>
+      <div class="dialog-body" id="dialog-body"></div>
+      <div class="actions">
+        <button class="btn btn--quiet" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn btn--primary" id="dialog-confirm" value="confirm">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
   <script type="module">
     import * as App from './js/app.js';
-    window.app = App; // Expose for onclick handlers
+    window.app = App; // Expose for inline handlers
     App.init();
   </script>
 </body>

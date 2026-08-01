@@ -1,0 +1,37 @@
+{
+  ".claude/settings.local.json": {
+    "mtime": 1785561020.4747453,
+    "ast_hash": "2017f22d72e0f161c9938b20429cd50f",
+    "semantic_hash": ""
+  },
+  "js/app.js": {
+    "mtime": 1785561195.5932002,
+    "ast_hash": "7ea9a0e68bdd53652f1a7d51d48e444c",
+    "semantic_hash": ""
+  },
+  "js/octopus.js": {
+    "mtime": 1785418006.7299144,
+    "ast_hash": "462f35a824d467fc34be1f9739385954",
+    "semantic_hash": ""
+  },
+  "AGENTS.md": {
+    "mtime": 1785527278.695408,
+    "ast_hash": "ec63327bd4c1b0658809cb8a6b307a3a",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1785527240.9733932,
+    "ast_hash": "ca5e3511345c8c46d586db1c55109dfa",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/specs/2026-07-31-plant-sheet-redesign-design.md": {
+    "mtime": 1785527307.7669892,
+    "ast_hash": "1e56ea2817f0a8050644cdf1f8af7ccf",
+    "semantic_hash": ""
+  },
+  "index.html": {
+    "mtime": 1785526639.0765798,
+    "ast_hash": "cede0f9d693ad2c19415cb96cbbe3c82",
+    "semantic_hash": ""
+  }
+}
